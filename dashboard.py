@@ -146,6 +146,23 @@ def get_git_branches():
         return []
 
 
+def get_events(tail=30):
+    events_file = FORGE_DIR / "logs" / "events.jsonl"
+    if not events_file.exists():
+        return []
+    try:
+        lines = events_file.read_text().strip().split("\n")
+        events = []
+        for line in lines[-tail:]:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return events
+    except Exception:
+        return []
+
+
 def build_api_response():
     tasks = get_tasks()
     locks = get_locks()
@@ -191,6 +208,7 @@ def build_api_response():
         "context": get_shared_context(),
         "mail": get_mail(),
         "commits": get_git_branches(),
+        "events": get_events(),
     }
 
 

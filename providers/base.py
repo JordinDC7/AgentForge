@@ -65,6 +65,11 @@ class TaskResult:
     duration_seconds: float = 0.0
     estimated_cost_usd: float = 0.0
     retry_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    model_used: str = ""
+    commit_sha: str = ""
 
 
 class BaseProvider(ABC):

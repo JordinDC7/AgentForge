@@ -211,7 +211,16 @@ def cmd_run(args):
     from providers.registry import detect_available_providers
     from core.orchestrator import Orchestrator, Task, TaskStatus, RunConfig
 
-    providers = detect_available_providers()
+    # Detect providers including plugins
+    plugin_dirs = []
+    plugin_path = Path.cwd() / "providers"
+    if plugin_path.exists():
+        plugin_dirs.append(plugin_path)
+    custom_plugins = Path.cwd() / ".forge" / "plugins"
+    if custom_plugins.exists():
+        plugin_dirs.append(custom_plugins)
+
+    providers = detect_available_providers(plugin_dirs=plugin_dirs if plugin_dirs else None)
     if not providers:
         print("❌ No providers available. Install at least one AI coding agent.")
         return
@@ -542,6 +551,108 @@ escalation:
     print(f"  gemini -p 'Read GEMINI.md and write tests'")
 
 
+def cmd_events(args):
+    """Show recent events from the event log."""
+    log_file = Path.cwd() / FORGE_DIR / "logs" / "events.jsonl"
+    if not log_file.exists():
+        print("No events yet. Run 'forge run' first.")
+        return
+
+    lines = log_file.read_text().strip().split("\n")
+    count = int(args[0]) if args else 20
+    recent = lines[-count:]
+
+    print(f"⚡ Recent Events (last {len(recent)})\n{'━' * 60}")
+    for line in recent:
+        try:
+            event = json.loads(line)
+            ts = event.get("timestamp", "")[:19]
+            etype = event.get("event", "?")
+            icon = {"task.completed": "✅", "task.failed": "❌", "task.started": "🚀",
+                    "task.retrying": "🔄", "budget.warning": "⚠️", "run.started": "▶️",
+                    "run.completed": "🏁", "discovery.complete": "📡"}.get(etype, "📋")
+            task_id = event.get("task_id", "")
+            message = event.get("message", event.get("title", ""))
+            print(f"  {icon} [{ts}] {etype:<20} {task_id:<25} {message[:40]}")
+        except json.JSONDecodeError:
+            continue
+
+
+def cmd_watch(args):
+    """Live tail of all agent logs."""
+    import time as _time
+    logs_dir = Path.cwd() / FORGE_DIR / "logs"
+    if not logs_dir.exists():
+        print("No logs yet. Run 'forge run' first.")
+        return
+
+    print("⚡ Watching agent logs (Ctrl+C to stop)\n" + "━" * 60)
+    # Track file positions
+    positions = {}
+    try:
+        while True:
+            for log_file in sorted(logs_dir.glob("*.log")):
+                pos = positions.get(log_file.name, 0)
+                try:
+                    size = log_file.stat().st_size
+                    if size > pos:
+                        with open(log_file, "r", errors="replace") as f:
+                            f.seek(pos)
+                            new_content = f.read()
+                            if new_content.strip():
+                                agent = log_file.stem
+                                for line in new_content.strip().split("\n")[-10:]:
+                                    print(f"  [{agent}] {line[:120]}")
+                        positions[log_file.name] = size
+                except Exception:
+                    pass
+            _time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
+def cmd_dag(args):
+    """Show the task dependency graph."""
+    from core.dag import DependencyGraph
+
+    forge_dir = Path.cwd() / FORGE_DIR
+    tasks_dir = forge_dir / "tasks"
+    if not tasks_dir.exists():
+        print("No tasks. Run 'forge plan' first.")
+        return
+
+    graph = DependencyGraph()
+    tasks = {}
+    for task_file in sorted(tasks_dir.glob("*.json")):
+        data = json.loads(task_file.read_text())
+        tasks[data["id"]] = data
+        graph.add_task(data["id"], data.get("depends_on", []))
+
+    try:
+        order = graph.topological_sort()
+        print(f"⚡ Task Dependency Graph ({len(order)} tasks)\n{'━' * 60}")
+        for task_id in order:
+            t = tasks.get(task_id, {})
+            status = t.get("status", "?")
+            icon = {"done": "✅", "in_progress": "🔄", "failed": "❌", "ready": "📋",
+                    "blocked": "⏳", "backlog": "📦"}.get(status, "?")
+            deps = t.get("depends_on", [])
+            dep_str = f" ← {', '.join(deps)}" if deps else ""
+            print(f"  {icon} {task_id:<30} {t.get('type', '?'):<12} {status:<12}{dep_str}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # Show critical path
+    estimates = {tid: t.get("estimated_minutes", 30) for tid, t in tasks.items()}
+    try:
+        critical = graph.get_critical_path(estimates)
+        if critical:
+            total_time = sum(estimates.get(t, 30) for t in critical)
+            print(f"\n  Critical path ({total_time}min est.): {' → '.join(critical)}")
+    except Exception:
+        pass
+
+
 def cmd_help(args):
     print_banner()
     print("Commands:")
@@ -552,6 +663,9 @@ def cmd_help(args):
     print("  health                     Project health + ship-readiness score")
     print("  discover                   Scan codebase for discoverable work")
     print("  status                     Task board + progress")
+    print("  dag                        Show task dependency graph")
+    print("  events [N]                 Show recent events (default: 20)")
+    print("  watch                      Live tail of agent logs")
     print("  providers                  List available AI providers")
     print("  cost                       Spending breakdown")
     print()
@@ -561,7 +675,7 @@ def cmd_help(args):
     print("  --until-score N            Run until health score >= N")
     print("  --provider NAME            Force ALL tasks to one provider")
     print("  --override TYPE=PROV,...   Override routing per task type")
-    print("  --goal 'text'              Set high-level goal for discovery")
+    print("  --goal 'text'              Set high-level goal for discovery + LLM planning")
     print("  --dry-run                  Show what would happen")
     print()
     print("Examples:")
@@ -570,6 +684,7 @@ def cmd_help(args):
     print("  forge run --budget 20 --until-score 80")
     print("  forge run --provider codex --budget 5")
     print("  forge run --override backend=codex,frontend=gemini")
+    print("  forge run --goal 'add user auth with OAuth2' --budget 20")
 
 
 def cli():
@@ -589,6 +704,9 @@ def cli():
         "status": cmd_status,
         "health": cmd_health,
         "discover": cmd_discover,
+        "dag": cmd_dag,
+        "events": cmd_events,
+        "watch": cmd_watch,
         "providers": cmd_providers,
         "cost": cmd_cost,
         "help": cmd_help,

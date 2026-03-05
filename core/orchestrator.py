@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import yaml
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -43,7 +44,9 @@ from pathlib import Path
 from typing import Optional
 
 from core.cost_router import CostRouter, TaskComplexity
+from core.dag import DependencyGraph, CycleError
 from core.discovery import DiscoveryEngine, DiscoveredWork
+from core.events import EventBus, EventType, Event
 from providers.base import BaseProvider, TaskResult
 
 
@@ -123,6 +126,19 @@ class Orchestrator:
         self._running = True
         self._style_guide: str = ""  # Cached project style guide
 
+        # DAG for dependency tracking
+        self._dag = DependencyGraph()
+
+        # Event bus for webhooks/notifications
+        self.events = EventBus(self.forge_dir)
+
+        # Context watcher — tracks SHARED.md hash to detect mid-run changes
+        self._shared_md_hash: str = ""
+        self._context_watcher_running = False
+
+        # Dynamic provider accuracy (updated from memory)
+        self._dynamic_accuracy: dict[str, float] = {}
+
         # Load routing overrides from forge.yaml if not set via CLI
         self._load_yaml_config()
 
@@ -160,10 +176,18 @@ class Orchestrator:
         if "max_cost_per_task" in data:
             self.config.max_cost_per_task = float(data["max_cost_per_task"])
 
+        # Event/webhook configuration
+        self.events.configure(data)
+
     def _handle_shutdown(self, signum, frame):
-        """Graceful shutdown on Ctrl+C."""
-        self._log("\n⚠ Shutdown requested. Finishing active tasks...")
+        """Graceful shutdown on Ctrl+C — saves checkpoint for resume."""
+        self._log("\n⚠ Shutdown requested. Saving checkpoint...")
         self._running = False
+        self._save_checkpoint()
+        self.events.emit(Event(type=EventType.RUN_COMPLETED, data={
+            "reason": "shutdown", "tasks_done": len([t for t in self.tasks if t.status == TaskStatus.DONE]),
+            "budget_spent": self.budget_spent,
+        }))
 
     # ════════════════════════════════════════════════════════════
     # INIT
@@ -172,6 +196,7 @@ class Orchestrator:
     def init_forge(self):
         """Initialize .forge/ directory structure."""
         for d in ["tasks", "locks", "logs", "context", "budget", "memory",
+                  "state", "prompts", "plugins",
                   "mail/architecture", "mail/backend", "mail/frontend",
                   "mail/testing", "mail/review", "mail/docs", "mail/broadcast"]:
             (self.forge_dir / d).mkdir(parents=True, exist_ok=True)
@@ -196,7 +221,7 @@ class Orchestrator:
 
     def run(self):
         """THE MAIN LOOP.
-        
+
         Standard mode: execute tasks → stop
         Continuous mode: execute → discover → execute → discover → ...
         Until-score mode: keep going until health score target met
@@ -212,6 +237,20 @@ class Orchestrator:
             self._log(f"   Goal: {self.config.goal}")
         self._log(f"   Tasks loaded: {len(self.tasks)}")
         self._log("═" * 60)
+
+        # Emit run started event
+        self.events.emit(Event(type=EventType.RUN_STARTED, data={
+            "mode": mode, "budget": self.config.budget, "tasks": len(self.tasks),
+        }))
+
+        # Restore checkpoint from previous crashed run
+        self._restore_checkpoint()
+
+        # Update dynamic provider accuracy from memory
+        self._update_dynamic_accuracy()
+
+        # Build the dependency DAG from all tasks
+        self._rebuild_dag()
 
         # Print how tasks will be routed
         task_types = list(set(t.type for t in self.tasks)) or ["architecture", "backend", "frontend", "testing", "review"]
@@ -235,8 +274,10 @@ class Orchestrator:
         if self._style_guide:
             self._log(f"  📐 Extracted project style guide ({len(self._style_guide)} chars)")
 
+        # Start context watcher thread
+        self._start_context_watcher()
+
         # Always create an architecture assessment task at the start
-        # This ensures Claude Sonnet runs to review the codebase and update shared context
         self._inject_architecture_task()
         # Create test-first tasks (tests before implementation) + review tasks
         if self.config.test_first:
@@ -251,7 +292,18 @@ class Orchestrator:
             remaining = self.config.budget - self.budget_spent
             if remaining <= 0:
                 self._log(f"\n💰 BUDGET EXHAUSTED (${self.budget_spent:.2f}/{self.config.budget:.2f})")
+                self.events.emit(Event(type=EventType.BUDGET_EXHAUSTED, data={
+                    "spent": self.budget_spent, "budget": self.config.budget,
+                }))
                 break
+            # Budget warning at 80%
+            if self.budget_spent >= self.config.budget * 0.8 and not getattr(self, '_budget_warned', False):
+                self._log(f"  ⚠ Budget 80% used: ${self.budget_spent:.2f}/${self.config.budget:.2f}")
+                self.events.emit(Event(type=EventType.BUDGET_WARNING, data={
+                    "spent": self.budget_spent, "budget": self.config.budget,
+                    "message": f"80% of budget used (${self.budget_spent:.2f}/${self.config.budget:.2f})",
+                }))
+                self._budget_warned = True
 
             # ── Score check (until-score mode) ──
             if self.config.until_score is not None:
@@ -262,8 +314,11 @@ class Orchestrator:
                     self._log(f"\n🎯 TARGET SCORE REACHED! {score} ≥ {self.config.until_score}")
                     break
 
-            # ── Update task statuses ──
+            # ── Update task statuses (DAG-aware) ──
             self._update_task_statuses()
+
+            # ── Checkpoint save every iteration ──
+            self._save_checkpoint()
 
             # ── Check if all tasks done ──
             active = [t for t in self.tasks if t.status not in (TaskStatus.DONE, TaskStatus.FAILED)]
@@ -280,6 +335,7 @@ class Orchestrator:
                     break
                 # New tasks found — inject review tasks for any new implementation work
                 self._inject_review_tasks()
+                self._rebuild_dag()
 
             # ── Discovery cycle (every N completed tasks) ──
             if self._tasks_completed_since_discovery >= self.config.discovery_interval:
@@ -289,20 +345,40 @@ class Orchestrator:
                 self._inject_architecture_task()
                 # Inject docs task if we've done enough implementation work
                 self._inject_docs_task()
+                # Rebuild DAG with new tasks
+                self._rebuild_dag()
 
-            # ── Find and dispatch ready tasks ──
-            ready = [t for t in self.tasks if t.status == TaskStatus.READY]
+            # ── Find and dispatch ready tasks (parallel, DAG-aware) ──
+            # Use DAG to find tasks whose dependencies are all met
+            done_ids = {t.id for t in self.tasks if t.status == TaskStatus.DONE}
+            in_progress_ids = {t.id for t in self.tasks if t.status == TaskStatus.IN_PROGRESS}
+            dag_ready_ids = set(self._dag.get_ready(done_ids, in_progress_ids))
+            ready = [t for t in self.tasks if t.status == TaskStatus.READY and t.id in dag_ready_ids]
+            # Fallback: also include READY tasks not in DAG (manually added)
+            ready += [t for t in self.tasks if t.status == TaskStatus.READY
+                      and t.id not in dag_ready_ids and not t.depends_on]
+            # Deduplicate
+            seen = set()
+            unique_ready = []
+            for t in ready:
+                if t.id not in seen:
+                    seen.add(t.id)
+                    unique_ready.append(t)
+            ready = unique_ready
             if ready:
                 ready.sort(key=lambda t: t.priority, reverse=True)
                 # Limit concurrent agents to avoid rate limits
                 in_flight = len(self._active_processes)
                 slots = self.config.max_concurrent - in_flight
 
-                for task in ready[:slots]:
+                # Filter to tasks that don't conflict with each other (file overlap check)
+                dispatchable = self._select_non_conflicting(ready[:slots * 2], slots)
+
+                for task in dispatchable:
                     if self.config.budget - self.budget_spent <= 0:
                         break
                     self._dispatch_task(task)
-                    time.sleep(3)  # Stagger spawns to spread token usage
+                    time.sleep(1)  # Brief stagger to avoid API burst
             else:
                 in_progress = [t for t in self.tasks if t.status == TaskStatus.IN_PROGRESS]
                 if in_progress:
@@ -322,6 +398,19 @@ class Orchestrator:
             self._sync_budget()
             time.sleep(self.config.poll_interval)
 
+        # Stop context watcher
+        self._context_watcher_running = False
+
+        # Final checkpoint
+        self._save_checkpoint()
+
+        # Emit run completed event
+        self.events.emit(Event(type=EventType.RUN_COMPLETED, data={
+            "tasks_done": len([t for t in self.tasks if t.status == TaskStatus.DONE]),
+            "tasks_failed": len([t for t in self.tasks if t.status == TaskStatus.FAILED]),
+            "budget_spent": self.budget_spent, "budget": self.config.budget,
+        }))
+
         self._print_summary()
 
     # ════════════════════════════════════════════════════════════
@@ -329,7 +418,10 @@ class Orchestrator:
     # ════════════════════════════════════════════════════════════
 
     def _run_discovery_cycle(self) -> int:
-        """Scan the project and generate new tasks from discovered work."""
+        """Scan the project and generate new tasks from discovered work.
+
+        Uses both filesystem-based discovery AND LLM-assisted planning.
+        """
         discovered = self.discovery.discover_all(self.config.goal)
         new_count = 0
 
@@ -347,10 +439,44 @@ class Orchestrator:
             self._save_task(task)
             new_count += 1
 
+        # LLM-assisted planning for the goal (only on first discovery with a goal)
+        if self.config.goal and not getattr(self, '_llm_planned', False):
+            self._llm_planned = True
+            llm_tasks = self._llm_assisted_plan(self.config.goal)
+            known_titles = {t.title for t in self.tasks}
+            task_ids_map = {}  # index -> task_id for dependency resolution
+            for i, td in enumerate(llm_tasks):
+                title = td.get("title", "")
+                if title in known_titles:
+                    continue
+                task_id = f"plan-{int(time.time())}-{new_count}"
+                task_ids_map[i] = task_id
+                # Resolve depends_on from indices to actual IDs
+                deps = []
+                for dep_idx in td.get("depends_on_index", []):
+                    if dep_idx in task_ids_map:
+                        deps.append(task_ids_map[dep_idx])
+                task = Task(
+                    id=task_id,
+                    type=td.get("type", "backend"),
+                    title=title,
+                    description=td.get("description", ""),
+                    priority=td.get("priority", 50),
+                    depends_on=deps,
+                    estimated_minutes=td.get("estimated_minutes", 30),
+                    source="llm-plan",
+                )
+                self.tasks.append(task)
+                self._save_task(task)
+                new_count += 1
+
         if new_count > 0:
             self._log(f"   📡 Discovered {new_count} new tasks")
-            for work in discovered[:new_count]:
+            for work in discovered[:min(new_count, len(discovered))]:
                 self._log(f"      [{work.source}] {work.title[:60]} (priority: {work.priority})")
+            self.events.emit(Event(type=EventType.DISCOVERY_COMPLETE, data={
+                "new_tasks": new_count, "total_tasks": len(self.tasks),
+            }))
 
         # Save health score to memory
         health = self.discovery.get_project_health()
@@ -420,6 +546,7 @@ class Orchestrator:
     def add_task(self, task: Task):
         self.tasks.append(task)
         self._save_task(task)
+        self._dag.add_task(task.id, task.depends_on)
 
     def _inject_architecture_task(self):
         """Run Claude Sonnet to assess the project — but skip if context is already fresh."""
@@ -744,9 +871,13 @@ class Orchestrator:
 
     def _update_task_statuses(self):
         done_ids = {t.id for t in self.tasks if t.status == TaskStatus.DONE}
+        in_progress_ids = {t.id for t in self.tasks if t.status == TaskStatus.IN_PROGRESS}
+        # Use DAG to find tasks whose deps are met
+        dag_ready = set(self._dag.get_ready(done_ids, in_progress_ids))
         for task in self.tasks:
             if task.status == TaskStatus.BACKLOG:
-                if not task.depends_on or all(dep in done_ids for dep in task.depends_on):
+                # DAG-aware: check if all dependencies are done
+                if task.id in dag_ready or (not task.depends_on or all(dep in done_ids for dep in task.depends_on)):
                     self._set_status(task, TaskStatus.READY)
             elif task.status == TaskStatus.BLOCKED:
                 # Unblock tasks whose lock has been cleared
@@ -843,6 +974,10 @@ class Orchestrator:
         )
         self.add_task(fix_task)
         self._log(f"  🔧 Created fix task for {critical} critical + {major} major review findings")
+        self.events.emit(Event(type=EventType.REVIEW_FINDINGS, data={
+            "task_id": review_task.id, "critical": critical, "major": major,
+            "message": f"Review found {critical} critical + {major} major issues",
+        }))
 
     def _dispatch_task(self, task: Task):
         self._log(f"\n🚀 Dispatching: {task.id} ({task.type}) — {task.title[:50]}")
@@ -903,8 +1038,12 @@ class Orchestrator:
             self._tasks_completed_since_discovery += 1
             return
 
-        # Setup
+        # Conflict-aware branch strategy: check if in-progress branches touch overlapping files
         branch = f"forge/{task.type}/{task.id}"
+        conflict_warning = self._check_branch_conflicts(task, branch)
+        if conflict_warning:
+            self._log(f"  ⚠ {conflict_warning}")
+
         task.branch = branch
         task.assigned_provider = decision.provider.name
         self._set_status(task, TaskStatus.IN_PROGRESS)
@@ -977,9 +1116,16 @@ class Orchestrator:
 
             self._active_processes[task.id] = proc
             self._log(f"  ✅ Spawned (PID: {proc.pid})")
+            self.events.emit(Event(type=EventType.TASK_STARTED, data={
+                "task_id": task.id, "title": task.title, "type": task.type,
+                "provider": decision.provider.name, "estimated_cost": decision.estimated_cost,
+            }))
         except Exception as e:
             self._log(f"  ❌ Spawn failed: {e}")
             self._set_status(task, TaskStatus.FAILED)
+            self.events.emit(Event(type=EventType.TASK_FAILED, data={
+                "task_id": task.id, "title": task.title, "error": str(e),
+            }))
 
     def _monitor_active_agents(self):
         completed = []
@@ -1068,6 +1214,11 @@ class Orchestrator:
                     self._log(f"  ✅ {task_id} DONE (${cost:.4f} [{cost_source}], {duration:.0f}s, {task.assigned_provider})")
                     self._save_to_memory(task, success=True)
                     self._write_completion_handoff(task, duration)
+                    self.events.emit(Event(type=EventType.TASK_COMPLETED, data={
+                        "task_id": task.id, "title": task.title, "type": task.type,
+                        "provider": task.assigned_provider, "cost": cost,
+                        "duration": duration, "message": f"{task.title} completed by {task.assigned_provider}",
+                    }))
 
                 # Auto-merge the agent's branch back to main
                 if task.status == TaskStatus.DONE and task.branch:
@@ -1102,6 +1253,10 @@ class Orchestrator:
                 error_context = self._extract_error_from_log(task)
                 if task.retries < task.max_retries:
                     self._log(f"  ⚠ {task_id} FAILED (retry {task.retries}/{task.max_retries}) — escalating")
+                    self.events.emit(Event(type=EventType.TASK_RETRYING, data={
+                        "task_id": task.id, "title": task.title, "retry": task.retries,
+                        "max_retries": task.max_retries, "provider": task.assigned_provider,
+                    }))
                     if error_context:
                         task.description += (
                             f"\n\n## PREVIOUS ATTEMPT CRASHED\n"
@@ -1116,6 +1271,11 @@ class Orchestrator:
                     self._log(f"  ❌ {task_id} FAILED permanently after {task.max_retries} retries")
                     self._set_status(task, TaskStatus.FAILED)
                     self._save_to_memory(task, success=False)
+                    self.events.emit(Event(type=EventType.TASK_FAILED, data={
+                        "task_id": task.id, "title": task.title, "type": task.type,
+                        "provider": task.assigned_provider, "retries": task.retries,
+                        "message": f"{task.title} failed after {task.retries} retries",
+                    }))
 
             (self.forge_dir / "locks" / f"{task_id}.lock").unlink(missing_ok=True)
             self._save_task(task)
@@ -1300,6 +1460,59 @@ class Orchestrator:
             return "\n".join(lines[-20:])
         except Exception:
             return ""
+
+    def _check_branch_conflicts(self, task: Task, branch: str) -> str:
+        """Check if this task's likely files overlap with any in-progress branch.
+
+        Returns a warning string if conflict detected, empty string if clean.
+        Injects the conflicting branch's diff context into the task prompt
+        so the agent can write compatible code.
+        """
+        in_progress = [t for t in self.tasks if t.status == TaskStatus.IN_PROGRESS and t.branch]
+        if not in_progress:
+            return ""
+
+        # Estimate which files this task will touch
+        task_files = self._estimate_task_files(task)
+        if not task_files:
+            return ""
+
+        for active_task in in_progress:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"main...{active_task.branch}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    continue
+                active_files = set(result.stdout.strip().split("\n"))
+                overlap = task_files & active_files
+                if overlap:
+                    # Inject warning into task description
+                    task.description += (
+                        f"\n\n## CONFLICT WARNING\n"
+                        f"Branch `{active_task.branch}` ({active_task.type}) is currently modifying "
+                        f"overlapping files: {', '.join(sorted(overlap)[:5])}\n"
+                        f"Be careful with these files. Avoid modifying them if possible, "
+                        f"or ensure your changes are compatible.\n"
+                    )
+                    return f"File overlap with {active_task.branch}: {', '.join(sorted(overlap)[:3])}"
+            except Exception:
+                continue
+        return ""
+
+    def _estimate_task_files(self, task: Task) -> set[str]:
+        """Estimate which files a task will touch based on description and type."""
+        files = set()
+        # Extract file paths from description
+        file_refs = re.findall(r'[\w./]+\.(?:py|js|ts|jsx|tsx|json|yaml|md)', task.description)
+        files.update(file_refs)
+        # Add common files by type
+        if task.type == "architecture":
+            files.add(".forge/context/SHARED.md")
+        elif task.type == "docs":
+            files.add("README.md")
+        return files
 
     def _try_auto_merge(self, task: Task):
         """Try to merge the agent's branch back to main. Skip on conflict."""
@@ -1886,6 +2099,307 @@ class Orchestrator:
         line = f"[{ts}] {msg}"
         print(line)
         self.run_log.append(line)
+
+    # ════════════════════════════════════════════════════════════
+    # DAG — DEPENDENCY GRAPH
+    # ════════════════════════════════════════════════════════════
+
+    def _rebuild_dag(self):
+        """Rebuild the dependency DAG from all current tasks."""
+        self._dag = DependencyGraph()
+        for task in self.tasks:
+            self._dag.add_task(task.id, task.depends_on)
+        try:
+            self._dag.validate()
+        except CycleError as e:
+            self._log(f"  ⚠ Circular dependency detected: {e}")
+            # Break the cycle by removing the last dependency
+            cycle = e.cycle
+            if len(cycle) >= 2:
+                breaker_id = cycle[-2]
+                breaker = next((t for t in self.tasks if t.id == breaker_id), None)
+                if breaker and cycle[-1] in breaker.depends_on:
+                    breaker.depends_on.remove(cycle[-1])
+                    self._save_task(breaker)
+                    self._log(f"    Broke cycle by removing {breaker_id} → {cycle[-1]} dependency")
+                    self._rebuild_dag()  # Retry
+
+    # ════════════════════════════════════════════════════════════
+    # PARALLEL DISPATCH — CONFLICT-AWARE
+    # ════════════════════════════════════════════════════════════
+
+    def _select_non_conflicting(self, candidates: list[Task], max_slots: int) -> list[Task]:
+        """Select tasks that won't conflict with each other or in-progress work.
+
+        Conflict = same files likely touched. Uses task type and description
+        heuristics since we don't know exact files before the agent runs.
+        """
+        if not candidates:
+            return []
+
+        selected = []
+        # Track which "areas" are claimed by in-progress tasks
+        claimed_areas = set()
+        for t in self.tasks:
+            if t.status == TaskStatus.IN_PROGRESS:
+                claimed_areas.update(self._task_areas(t))
+
+        for task in candidates:
+            if len(selected) >= max_slots:
+                break
+            areas = self._task_areas(task)
+            # Check if this task overlaps with any claimed area
+            if areas & claimed_areas:
+                continue  # Skip — would conflict
+            claimed_areas.update(areas)
+            selected.append(task)
+
+        return selected
+
+    def _task_areas(self, task: Task) -> set[str]:
+        """Estimate which code areas a task will touch based on type/description."""
+        areas = {task.type}  # At minimum, the task type is an area
+        desc = task.description.lower()
+
+        # Extract mentioned file paths
+        file_refs = re.findall(r'[\w/]+\.(?:py|js|ts|jsx|tsx)', desc)
+        areas.update(file_refs)
+
+        # Extract mentioned modules/components
+        for pattern in [r'(?:module|component|file)\s+[`\'"]?(\w+)', r'(\w+\.py)', r'(\w+\.ts)']:
+            for match in re.findall(pattern, desc):
+                areas.add(match.lower())
+
+        return areas
+
+    # ════════════════════════════════════════════════════════════
+    # CONTEXT WATCHER — DETECT SHARED.MD CHANGES MID-RUN
+    # ════════════════════════════════════════════════════════════
+
+    def _start_context_watcher(self):
+        """Start a background thread that watches SHARED.md for changes."""
+        context_file = self.forge_dir / "context" / "SHARED.md"
+        if context_file.exists():
+            self._shared_md_hash = self._file_hash(context_file)
+
+        self._context_watcher_running = True
+        watcher = threading.Thread(target=self._context_watcher_loop, daemon=True)
+        watcher.start()
+
+    def _context_watcher_loop(self):
+        """Background loop that checks for SHARED.md changes every 15s."""
+        context_file = self.forge_dir / "context" / "SHARED.md"
+        while self._context_watcher_running:
+            time.sleep(15)
+            if not context_file.exists():
+                continue
+            new_hash = self._file_hash(context_file)
+            if new_hash != self._shared_md_hash and self._shared_md_hash:
+                self._shared_md_hash = new_hash
+                self._log("  📝 SHARED.md changed mid-run — context delta will be injected into next prompts")
+                # Write a broadcast mail so in-flight agents get notified on next prompt
+                mail_dir = self.forge_dir / "mail" / "broadcast"
+                mail_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                (mail_dir / f"{ts}-context-update.md").write_text(
+                    f"FROM: system\nTO: broadcast\nRE: SHARED.md updated\n---\n"
+                    f"The shared context (.forge/context/SHARED.md) was updated at {ts}.\n"
+                    f"Re-read it before making assumptions about the architecture.\n"
+                )
+            elif not self._shared_md_hash:
+                self._shared_md_hash = new_hash
+
+    @staticmethod
+    def _file_hash(path: Path) -> str:
+        """Quick hash of file contents for change detection."""
+        import hashlib
+        try:
+            return hashlib.md5(path.read_bytes()).hexdigest()
+        except Exception:
+            return ""
+
+    # ════════════════════════════════════════════════════════════
+    # DYNAMIC PROVIDER ACCURACY
+    # ════════════════════════════════════════════════════════════
+
+    def _update_dynamic_accuracy(self):
+        """Update provider accuracy scores based on actual performance from memory.
+
+        Blends the benchmark score with real observed success rates:
+        effective_score = 0.5 * benchmark + 0.5 * observed
+        (Only adjusts after 3+ data points to avoid noise)
+        """
+        memory = self.load_memory()
+        history = memory.get("task_history", [])
+        if not history:
+            return
+
+        # Aggregate success rates per provider per task type
+        stats: dict[str, dict] = {}  # provider -> {successes, total}
+        for entry in history:
+            provider = entry.get("provider", "")
+            if not provider:
+                continue
+            if provider not in stats:
+                stats[provider] = {"successes": 0, "total": 0}
+            stats[provider]["total"] += 1
+            if entry.get("success"):
+                stats[provider]["successes"] += 1
+
+        # Update provider accuracy scores
+        for p in self.providers:
+            if p.name in stats and stats[p.name]["total"] >= 3:
+                observed = stats[p.name]["successes"] / stats[p.name]["total"]
+                benchmark = p.config.accuracy_score
+                # Blend: half benchmark, half observed
+                effective = 0.5 * benchmark + 0.5 * observed
+                old = p.config.accuracy_score
+                p.config.accuracy_score = round(effective, 3)
+                self._dynamic_accuracy[p.name] = effective
+                if abs(old - effective) > 0.05:
+                    self._log(f"  📊 {p.name} accuracy: {old:.2f} → {effective:.2f} (observed: {observed:.0%} over {stats[p.name]['total']} tasks)")
+
+    # ════════════════════════════════════════════════════════════
+    # CHECKPOINT / RESUME
+    # ════════════════════════════════════════════════════════════
+
+    def _save_checkpoint(self):
+        """Save orchestrator state for crash recovery."""
+        checkpoint = {
+            "timestamp": datetime.now().isoformat(),
+            "budget_spent": self.budget_spent,
+            "tasks_completed_since_discovery": self._tasks_completed_since_discovery,
+            "active_task_ids": list(self._active_processes.keys()),
+            "iteration": getattr(self, '_current_iteration', 0),
+        }
+        checkpoint_file = self.forge_dir / "state" / "checkpoint.json"
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            checkpoint_file.write_text(json.dumps(checkpoint, indent=2))
+        except Exception:
+            pass
+
+    def _restore_checkpoint(self):
+        """Restore state from a previous checkpoint if it exists."""
+        checkpoint_file = self.forge_dir / "state" / "checkpoint.json"
+        if not checkpoint_file.exists():
+            return
+
+        try:
+            data = json.loads(checkpoint_file.read_text())
+        except (json.JSONDecodeError, Exception):
+            return
+
+        # Restore budget tracking from the ledger (more accurate than checkpoint)
+        ledger_file = self.forge_dir / "budget" / "token_ledger.json"
+        if ledger_file.exists():
+            try:
+                ledger = json.loads(ledger_file.read_text())
+                total = sum(e.get("cost_usd", 0) for e in ledger)
+                if total > 0:
+                    self.budget_spent = round(total, 4)
+                    self._log(f"  🔄 Restored budget: ${self.budget_spent:.2f} spent (from ledger)")
+            except Exception:
+                pass
+
+        # Mark previously active tasks for reset
+        active_ids = set(data.get("active_task_ids", []))
+        if active_ids:
+            self._log(f"  🔄 Checkpoint found {len(active_ids)} previously active tasks — will reset")
+
+        # Clean up the checkpoint now that we've restored
+        try:
+            checkpoint_file.unlink()
+        except Exception:
+            pass
+
+    # ════════════════════════════════════════════════════════════
+    # LLM-ASSISTED PLANNING
+    # ════════════════════════════════════════════════════════════
+
+    def _llm_assisted_plan(self, goal: str) -> list[dict]:
+        """Use a cheap LLM to decompose a complex goal into structured tasks.
+
+        Tries Gemini (free) first, falls back to cheapest available provider.
+        Returns a list of task dicts or empty list on failure.
+        """
+        if not goal:
+            return []
+
+        # Build a planning prompt
+        existing_files = []
+        for ext in ["*.py", "*.js", "*.ts", "*.jsx", "*.tsx"]:
+            for f in self.project_dir.rglob(ext):
+                if ".forge" not in str(f) and "node_modules" not in str(f) and "venv" not in str(f):
+                    existing_files.append(str(f.relative_to(self.project_dir)))
+        file_list = "\n".join(f"  - {f}" for f in existing_files[:30])
+
+        planning_prompt = f"""You are a software architect planning work for a multi-agent coding team.
+
+Goal: {goal}
+
+Existing files:
+{file_list}
+
+Decompose this goal into 3-8 concrete tasks. Each task should be a single focused unit of work.
+
+Output ONLY a JSON array. Each task object has:
+- "title": short title (50 chars max)
+- "type": one of "architecture", "backend", "frontend", "testing", "docs"
+- "description": what to implement (2-3 sentences)
+- "depends_on_index": array of task indices this depends on (0-based), or empty array
+- "priority": 0-100 (higher = more important)
+- "estimated_minutes": rough time estimate
+
+Example:
+[
+  {{"title": "Design auth API", "type": "architecture", "description": "Design OAuth2 flow...", "depends_on_index": [], "priority": 90, "estimated_minutes": 15}},
+  {{"title": "Implement auth backend", "type": "backend", "description": "Build the auth endpoints...", "depends_on_index": [0], "priority": 80, "estimated_minutes": 45}}
+]
+
+Output ONLY valid JSON, no markdown fences, no explanation."""
+
+        # Find cheapest provider for planning
+        planning_provider = None
+        for p in sorted(self.providers, key=lambda x: x.config.cost_per_hour_usd):
+            if p.is_available():
+                planning_provider = p
+                break
+
+        if not planning_provider:
+            return []
+
+        try:
+            cmd = planning_provider.build_command(
+                prompt=planning_prompt, workdir=self.project_dir,
+                effort="low",
+            )
+            result = subprocess.run(
+                cmd, cwd=self.project_dir, capture_output=True, text=True,
+                timeout=120, env={**os.environ, "FORGE_PLANNING": "1"},
+            )
+
+            if result.returncode != 0:
+                return []
+
+            # Parse JSON from output (handle stream-json from Claude)
+            output = result.stdout.strip()
+
+            # Try to find JSON array in the output
+            json_match = re.search(r'\[[\s\S]*\]', output)
+            if not json_match:
+                return []
+
+            tasks_data = json.loads(json_match.group())
+            if not isinstance(tasks_data, list):
+                return []
+
+            self._log(f"  🧠 LLM planner generated {len(tasks_data)} tasks via {planning_provider.name}")
+            return tasks_data
+
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+            self._log(f"  ⚠ LLM planning failed: {e}")
+            return []
 
     # ════════════════════════════════════════════════════════════
     # SUMMARY

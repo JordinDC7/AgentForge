@@ -1,5 +1,7 @@
 """Provider implementations for all major AI coding agents."""
 
+import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -236,14 +238,22 @@ class GeminiProvider(BaseProvider):
         return cmd
 
     def parse_output(self, stdout, stderr, returncode) -> TaskResult:
-        return TaskResult(
+        result = TaskResult(
             success=returncode == 0,
-            task_id="",
-            agent_name="gemini",
-            provider_name="gemini",
-            branch="",
+            task_id="", agent_name="gemini", provider_name="gemini", branch="",
             error_message=stderr if returncode != 0 else "",
         )
+        # Parse token usage from Gemini output
+        token_match = re.search(r'(\d+)\s*tokens?\s*used', stdout, re.IGNORECASE)
+        if token_match:
+            result.total_tokens = int(token_match.group(1))
+            result.input_tokens = int(result.total_tokens * 0.7)
+            result.output_tokens = result.total_tokens - result.input_tokens
+        # Extract files changed from git-style output
+        file_matches = re.findall(r'(?:Created|Modified|Updated)\s+[`\'"]?([^\s`\'"]+\.\w+)', stdout)
+        if file_matches:
+            result.files_changed = file_matches
+        return result
 
 
 class CodexProvider(BaseProvider):
@@ -268,14 +278,22 @@ class CodexProvider(BaseProvider):
         return cmd
 
     def parse_output(self, stdout, stderr, returncode) -> TaskResult:
-        return TaskResult(
+        result = TaskResult(
             success=returncode == 0,
-            task_id="",
-            agent_name=self.config.name,
-            provider_name=self.config.name,
-            branch="",
-            error_message=stderr if returncode != 0 else "",
+            task_id="", agent_name=self.config.name, provider_name=self.config.name,
+            branch="", error_message=stderr if returncode != 0 else "",
         )
+        # Parse Codex token usage: "tokens used\n7,978"
+        token_matches = re.findall(r'tokens\s+used\s*\n\s*([\d,]+)', stdout)
+        if token_matches:
+            result.total_tokens = int(token_matches[-1].replace(",", ""))
+            result.input_tokens = int(result.total_tokens * 0.75)
+            result.output_tokens = result.total_tokens - result.input_tokens
+        # Parse files from Codex output
+        file_matches = re.findall(r'(?:Wrote|Edited|Created)\s+([^\s]+\.\w+)', stdout)
+        if file_matches:
+            result.files_changed = file_matches
+        return result
 
 
 class ClaudeProvider(BaseProvider):
@@ -306,14 +324,38 @@ class ClaudeProvider(BaseProvider):
         return cmd
 
     def parse_output(self, stdout, stderr, returncode) -> TaskResult:
-        return TaskResult(
+        result = TaskResult(
             success=returncode == 0,
-            task_id="",
-            agent_name="claude",
-            provider_name=self.config.name,
-            branch="",
-            error_message=stderr if returncode != 0 else "",
+            task_id="", agent_name="claude", provider_name=self.config.name,
+            branch="", error_message=stderr if returncode != 0 else "",
         )
+        # Parse Claude stream-json: each line is a JSON object
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Result line has total cost
+            if obj.get("type") == "result":
+                if "total_cost_usd" in obj:
+                    result.estimated_cost_usd = float(obj["total_cost_usd"])
+                elif "cost_usd" in obj:
+                    result.estimated_cost_usd = float(obj["cost_usd"])
+                if "model" in obj:
+                    result.model_used = obj["model"]
+            # Usage stats from assistant messages
+            msg = obj.get("message", {})
+            usage = msg.get("usage") or obj.get("usage") or {}
+            if "input_tokens" in usage:
+                result.input_tokens += int(usage["input_tokens"])
+            if "output_tokens" in usage:
+                result.output_tokens += int(usage["output_tokens"])
+
+        result.total_tokens = result.input_tokens + result.output_tokens
+        return result
 
 
 class AiderProvider(BaseProvider):
@@ -338,14 +380,29 @@ class AiderProvider(BaseProvider):
         return cmd
 
     def parse_output(self, stdout, stderr, returncode) -> TaskResult:
-        return TaskResult(
+        result = TaskResult(
             success=returncode == 0,
-            task_id="",
-            agent_name="aider",
-            provider_name="aider",
-            branch="",
-            error_message=stderr if returncode != 0 else "",
+            task_id="", agent_name="aider", provider_name="aider",
+            branch="", error_message=stderr if returncode != 0 else "",
         )
+        # Parse Aider output: "Tokens: 5.2k sent, 1.1k received. Cost: $0.01"
+        cost_match = re.search(r'Cost:\s*\$([0-9.]+)', stdout)
+        if cost_match:
+            result.estimated_cost_usd = float(cost_match.group(1))
+        sent_match = re.search(r'([\d.]+)k?\s*sent', stdout)
+        recv_match = re.search(r'([\d.]+)k?\s*received', stdout)
+        if sent_match:
+            val = float(sent_match.group(1))
+            result.input_tokens = int(val * 1000) if val < 100 else int(val)
+        if recv_match:
+            val = float(recv_match.group(1))
+            result.output_tokens = int(val * 1000) if val < 100 else int(val)
+        result.total_tokens = result.input_tokens + result.output_tokens
+        # Parse edited files
+        file_matches = re.findall(r'Wrote\s+([^\s]+)', stdout)
+        if file_matches:
+            result.files_changed = file_matches
+        return result
 
 
 class OpenCodeProvider(BaseProvider):
@@ -370,11 +427,8 @@ class OpenCodeProvider(BaseProvider):
     def parse_output(self, stdout, stderr, returncode) -> TaskResult:
         return TaskResult(
             success=returncode == 0,
-            task_id="",
-            agent_name="opencode",
-            provider_name="opencode",
-            branch="",
-            error_message=stderr if returncode != 0 else "",
+            task_id="", agent_name="opencode", provider_name="opencode",
+            branch="", error_message=stderr if returncode != 0 else "",
         )
 
 
@@ -395,26 +449,39 @@ PROVIDER_CLASSES: dict[str, type[BaseProvider]] = {
 
 
 def get_provider(name: str, config_override: Optional[dict] = None) -> BaseProvider:
-    """Get a provider instance by name with optional config overrides."""
-    if name not in PROVIDER_DEFAULTS:
-        raise ValueError(f"Unknown provider: {name}. Available: {list(PROVIDER_DEFAULTS.keys())}")
+    """Get a provider instance by name with optional config overrides.
 
-    config = PROVIDER_DEFAULTS[name]
-    if config_override:
-        for key, val in config_override.items():
-            if hasattr(config, key):
-                setattr(config, key, val)
+    Checks built-in providers first, then loaded plugins.
+    """
+    if name in PROVIDER_DEFAULTS:
+        config = PROVIDER_DEFAULTS[name]
+        if config_override:
+            for key, val in config_override.items():
+                if hasattr(config, key):
+                    setattr(config, key, val)
+        cls = PROVIDER_CLASSES.get(name)
+        if not cls:
+            raise ValueError(f"No implementation for provider: {name}")
+        return cls(config)
 
-    cls = PROVIDER_CLASSES.get(name)
-    if not cls:
-        raise ValueError(f"No implementation for provider: {name}")
+    # Check plugins
+    try:
+        from core.plugins import PluginLoader
+        loader = PluginLoader()
+        provider = loader.create_provider(name, config_override)
+        if provider:
+            return provider
+    except ImportError:
+        pass
 
-    return cls(config)
+    raise ValueError(f"Unknown provider: {name}. Available: {list(PROVIDER_DEFAULTS.keys())}")
 
 
-def detect_available_providers() -> list[BaseProvider]:
-    """Scan system for all available/installed providers."""
+def detect_available_providers(plugin_dirs: Optional[list[Path]] = None) -> list[BaseProvider]:
+    """Scan system for all available/installed providers, including plugins."""
     available = []
+
+    # Built-in providers
     for name in PROVIDER_DEFAULTS:
         try:
             provider = get_provider(name)
@@ -422,4 +489,22 @@ def detect_available_providers() -> list[BaseProvider]:
                 available.append(provider)
         except Exception:
             continue
+
+    # Plugin providers
+    if plugin_dirs:
+        try:
+            from core.plugins import PluginLoader
+            loader = PluginLoader()
+            for d in plugin_dirs:
+                plugins = loader.load_directory(d)
+                for name, (config, cls) in plugins.items():
+                    try:
+                        provider = cls(config)
+                        if provider.is_available():
+                            available.append(provider)
+                    except Exception:
+                        continue
+        except ImportError:
+            pass
+
     return available

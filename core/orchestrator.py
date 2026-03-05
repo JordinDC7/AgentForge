@@ -93,7 +93,7 @@ class RunConfig:
     dry_run: bool = False
     poll_interval: int = 10
     discovery_interval: int = 3              # Run discovery every N completed tasks
-    max_iterations: int = 500                # Safety cap for continuous mode
+    max_iterations: int = 500                # Safety cap for standard mode (continuous overrides to unlimited)
     max_concurrent: int = 2                  # Max agents running at same time (rate limit safety)
     max_cost_per_task: float = 5.0           # Max USD per individual task (safety cap)
     goal: str = ""                           # High-level goal description
@@ -284,8 +284,14 @@ class Orchestrator:
             self._inject_test_first_tasks()
         self._inject_review_tasks()
 
+        # In continuous/until-score mode, run effectively forever (budget is the real limit)
+        max_iter = self.config.max_iterations
+        if self.config.continuous or self.config.until_score is not None:
+            max_iter = 999_999_999  # ~317 years at 10s/iter — budget will stop it first
+
         iteration = 0
-        while self._running and iteration < self.config.max_iterations:
+        self._last_discovery_time = time.time()
+        while self._running and iteration < max_iter:
             iteration += 1
 
             # ── Budget check ──
@@ -326,21 +332,31 @@ class Orchestrator:
                 self._log("\n📡 All current tasks done. Running discovery for more work...")
                 new_count = self._run_discovery_cycle()
                 if new_count == 0:
-                    self._log("   No new work discovered. Project looks complete!")
-                    if self.config.until_score is not None:
-                        # Keep checking in until-score mode
-                        time.sleep(self.config.poll_interval * 3)
+                    self._log("   No new work discovered.")
+                    if self.config.continuous or self.config.until_score is not None:
+                        # Continuous/until-score: keep looping, re-discover periodically
+                        self._log("   Continuous mode — sleeping then re-discovering...")
+                        time.sleep(self.config.poll_interval * 6)  # ~60s pause before re-scan
                         continue
                     self._log("\n✅ ALL TASKS COMPLETE")
                     break
                 # New tasks found — inject review tasks for any new implementation work
+                if self.config.test_first:
+                    self._inject_test_first_tasks()
                 self._inject_review_tasks()
                 self._rebuild_dag()
 
-            # ── Discovery cycle (every N completed tasks) ──
-            if self._tasks_completed_since_discovery >= self.config.discovery_interval:
+            # ── Discovery cycle (every N completed tasks OR every 5 min in continuous) ──
+            time_since_discovery = time.time() - self._last_discovery_time
+            discovery_due_by_count = self._tasks_completed_since_discovery >= self.config.discovery_interval
+            discovery_due_by_time = (self.config.continuous and time_since_discovery > 300)  # 5 min
+
+            if discovery_due_by_count or discovery_due_by_time:
+                if discovery_due_by_time:
+                    self._log(f"  📡 Periodic re-discovery ({int(time_since_discovery)}s since last scan)")
                 self._run_discovery_cycle()
                 self._tasks_completed_since_discovery = 0
+                self._last_discovery_time = time.time()
                 # Re-run architecture to update SHARED.md with what was built
                 self._inject_architecture_task()
                 # Inject docs task if we've done enough implementation work
@@ -392,6 +408,9 @@ class Orchestrator:
                     if blocked:
                         self._log(f"⚠ {len(blocked)} blocked tasks. Breaking deadlock.")
                         self._set_status(blocked[0], TaskStatus.READY)
+                    # MUST sleep to avoid CPU spin when no tasks are actionable
+                    # (e.g., all tasks BACKLOG with unmet deps, or waiting for discovery)
+                    time.sleep(self.config.poll_interval)
                     continue
 
             self._monitor_active_agents()
@@ -871,11 +890,18 @@ class Orchestrator:
 
     def _update_task_statuses(self):
         done_ids = {t.id for t in self.tasks if t.status == TaskStatus.DONE}
+        failed_ids = {t.id for t in self.tasks if t.status == TaskStatus.FAILED}
         in_progress_ids = {t.id for t in self.tasks if t.status == TaskStatus.IN_PROGRESS}
         # Use DAG to find tasks whose deps are met
         dag_ready = set(self._dag.get_ready(done_ids, in_progress_ids))
         for task in self.tasks:
             if task.status == TaskStatus.BACKLOG:
+                # Check if any dependency has FAILED — if so, this task can never run
+                if task.depends_on and any(dep in failed_ids for dep in task.depends_on):
+                    failed_dep = next(d for d in task.depends_on if d in failed_ids)
+                    self._log(f"  ⚠ {task.id} depends on failed task {failed_dep} — marking FAILED")
+                    self._set_status(task, TaskStatus.FAILED)
+                    continue
                 # DAG-aware: check if all dependencies are done
                 if task.id in dag_ready or (not task.depends_on or all(dep in done_ids for dep in task.depends_on)):
                     self._set_status(task, TaskStatus.READY)

@@ -236,13 +236,11 @@ def cmd_run(args):
 
     orch = Orchestrator(Path.cwd(), providers, config)
 
-    # Load existing tasks from .forge/tasks/
+    # Load existing tasks from .forge/tasks/ (including completed ones for dedup)
     tasks_dir = Path.cwd() / FORGE_DIR / "tasks"
     if tasks_dir.exists():
         for task_file in sorted(tasks_dir.glob("*.json")):
             data = json.loads(task_file.read_text())
-            if data.get("status") in ("done", "failed"):
-                continue  # Skip completed tasks
             task = Task(
                 id=data["id"], type=data["type"], title=data["title"],
                 description=data["description"],
@@ -251,12 +249,16 @@ def cmd_run(args):
                 estimated_minutes=data.get("estimated_minutes", 30),
                 source=data.get("source", "manual"),
             )
+            # Restore persisted status
+            persisted_status = data.get("status", "backlog")
+            status_map = {
+                "done": TaskStatus.DONE, "failed": TaskStatus.FAILED,
+                "in_progress": TaskStatus.IN_PROGRESS, "in_review": TaskStatus.IN_REVIEW,
+                "blocked": TaskStatus.BLOCKED, "ready": TaskStatus.READY,
+                "backlog": TaskStatus.BACKLOG,
+            }
+            task.status = status_map.get(persisted_status, TaskStatus.BACKLOG)
             orch.add_task(task)
-
-    # In continuous/goal mode, it's OK to start with no tasks — discovery will find work
-    if not orch.tasks and not config.continuous and not config.until_score:
-        print("❌ No tasks found. Run 'forge plan' first, or use --continuous for auto-discovery.")
-        return
 
     mode_str = "CONTINUOUS" if config.continuous else ("UNTIL SCORE ≥ " + str(config.until_score) if config.until_score else "STANDARD")
     print(f"\n⚡ Starting forge run — {mode_str} — budget: ${config.budget:.2f}")

@@ -212,10 +212,17 @@ class Orchestrator:
         task_types = list(set(t.type for t in self.tasks)) or ["architecture", "backend", "frontend", "testing", "review"]
         self._print_routing_table(task_types)
 
-        # If no tasks yet, run initial discovery
-        if not self.tasks:
-            self._log("\n📡 No tasks found. Running discovery...")
+        # If no tasks, or all tasks from a prior run are already done, run discovery
+        all_finished = self.tasks and all(
+            t.status in (TaskStatus.DONE, TaskStatus.FAILED) for t in self.tasks
+        )
+        if not self.tasks or all_finished:
+            reason = "All prior tasks finished" if all_finished else "No tasks found"
+            self._log(f"\n📡 {reason}. Running discovery...")
             self._run_discovery_cycle()
+
+        # Clean up stale locks from previous runs
+        self._cleanup_stale_locks()
 
         # Always create an architecture assessment task at the start
         # This ensures Claude Sonnet runs to review the codebase and update shared context
@@ -248,23 +255,21 @@ class Orchestrator:
             # ── Check if all tasks done ──
             active = [t for t in self.tasks if t.status not in (TaskStatus.DONE, TaskStatus.FAILED)]
             if not active:
-                if self.config.continuous or self.config.until_score is not None:
-                    self._log("\n📡 All current tasks done. Running discovery for more work...")
-                    new_count = self._run_discovery_cycle()
-                    if new_count == 0:
-                        self._log("   No new work discovered. Project looks complete!")
-                        if not self.config.until_score:
-                            break
-                        # If until-score mode, keep checking
+                self._log("\n📡 All current tasks done. Running discovery for more work...")
+                new_count = self._run_discovery_cycle()
+                if new_count == 0:
+                    self._log("   No new work discovered. Project looks complete!")
+                    if self.config.until_score is not None:
+                        # Keep checking in until-score mode
                         time.sleep(self.config.poll_interval * 3)
                         continue
-                else:
                     self._log("\n✅ ALL TASKS COMPLETE")
                     break
+                # New tasks found — inject review tasks for any new implementation work
+                self._inject_review_tasks()
 
             # ── Discovery cycle (every N completed tasks) ──
-            if (self._tasks_completed_since_discovery >= self.config.discovery_interval
-                    and (self.config.continuous or self.config.until_score)):
+            if self._tasks_completed_since_discovery >= self.config.discovery_interval:
                 self._run_discovery_cycle()
                 self._tasks_completed_since_discovery = 0
 
@@ -475,6 +480,30 @@ class Orchestrator:
             )
             self.add_task(review_task)
 
+    def _cleanup_stale_locks(self):
+        """Remove lock files from previous runs that no longer have active processes."""
+        locks_dir = self.forge_dir / "locks"
+        if not locks_dir.exists():
+            return
+        cleaned = 0
+        for lock_file in locks_dir.glob("*.lock"):
+            try:
+                lock_data = json.loads(lock_file.read_text())
+                started = lock_data.get("started", "")
+                if started:
+                    lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                    if lock_age > self.config.timeout_minutes * 60:
+                        lock_file.unlink()
+                        cleaned += 1
+                else:
+                    lock_file.unlink()
+                    cleaned += 1
+            except Exception:
+                lock_file.unlink()
+                cleaned += 1
+        if cleaned:
+            self._log(f"  🔓 Cleaned {cleaned} stale lock(s) from previous run")
+
     def _set_status(self, task: Task, status: TaskStatus):
         """Change task status and sync to disk so dashboard can see it."""
         task.status = status
@@ -486,6 +515,11 @@ class Orchestrator:
             if task.status == TaskStatus.BACKLOG:
                 if not task.depends_on or all(dep in done_ids for dep in task.depends_on):
                     self._set_status(task, TaskStatus.READY)
+            elif task.status == TaskStatus.BLOCKED:
+                # Unblock tasks whose lock has been cleared
+                lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
+                if not lock_file.exists():
+                    self._set_status(task, TaskStatus.READY)
 
     def _dispatch_task(self, task: Task):
         self._log(f"\n🚀 Dispatching: {task.id} ({task.type}) — {task.title[:50]}")
@@ -495,10 +529,27 @@ class Orchestrator:
         if lock_file.exists():
             try:
                 lock_data = json.loads(lock_file.read_text())
-                self._log(f"  ⚠ Skipping — already locked by {lock_data.get('agent', '?')}")
-                return
+                started = lock_data.get("started", "")
+                # Check if this is a stale lock (older than timeout)
+                if started:
+                    from datetime import datetime as dt
+                    try:
+                        lock_age = (datetime.now() - dt.fromisoformat(started)).total_seconds()
+                        if lock_age > self.config.timeout_minutes * 60:
+                            self._log(f"  🔓 Clearing stale lock ({int(lock_age/60)}min old)")
+                            lock_file.unlink()
+                        else:
+                            self._log(f"  ⚠ Skipping — locked by {lock_data.get('agent', '?')} ({int(lock_age/60)}min ago)")
+                            self._set_status(task, TaskStatus.BLOCKED)
+                            return
+                    except (ValueError, TypeError):
+                        lock_file.unlink()  # Corrupt timestamp, clear it
+                else:
+                    self._log(f"  ⚠ Skipping — already locked by {lock_data.get('agent', '?')}")
+                    self._set_status(task, TaskStatus.BLOCKED)
+                    return
             except Exception:
-                pass  # Stale/corrupt lock, proceed
+                lock_file.unlink()  # Corrupt lock, clear it
 
         # Resolve provider (with overrides)
         preferred = self._resolve_provider(task)

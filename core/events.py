@@ -156,7 +156,7 @@ class EventBus:
         log_file = self.forge_dir / "logs" / "events.jsonl"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(log_file, "a") as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 f.write(event.to_json() + "\n")
         except Exception:
             pass

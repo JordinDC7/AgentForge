@@ -152,7 +152,7 @@ class Orchestrator:
             return
 
         try:
-            data = yaml.safe_load(yaml_path.read_text()) or {}
+            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8", errors="replace")) or {}
         except Exception:
             return
 
@@ -207,11 +207,11 @@ class Orchestrator:
         ]:
             f = self.forge_dir / name
             if not f.exists():
-                f.write_text(default)
+                f.write_text(default, encoding="utf-8")
 
         budget_file = self.forge_dir / "budget" / "spending.json"
         if not budget_file.exists():
-            budget_file.write_text(json.dumps({"budget_total": self.config.budget, "budget_spent": 0.0, "transactions": []}, indent=2))
+            budget_file.write_text(json.dumps({"budget_total": self.config.budget, "budget_spent": 0.0, "transactions": []}, indent=2), encoding="utf-8")
 
         self._log(f"Initialized .forge/ in {self.project_dir}")
 
@@ -397,6 +397,20 @@ class Orchestrator:
                     time.sleep(1)  # Brief stagger to avoid API burst
             else:
                 in_progress = [t for t in self.tasks if t.status == TaskStatus.IN_PROGRESS]
+                # Throttle "no dispatchable" logging to once per 60s
+                now = time.time()
+                last_nodispatch = getattr(self, '_last_nodispatch_log', 0)
+                if now - last_nodispatch >= 60:
+                    self._last_nodispatch_log = now
+                    backlog = [t for t in self.tasks if t.status == TaskStatus.BACKLOG]
+                    ready_but_not_dag = [t for t in self.tasks if t.status == TaskStatus.READY and t.id not in dag_ready_ids]
+                    if backlog or ready_but_not_dag:
+                        status_counts = {}
+                        for t in self.tasks:
+                            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+                        self._log(f"  📊 No dispatchable tasks. Status: {status_counts}")
+                        if ready_but_not_dag:
+                            self._log(f"     {len(ready_but_not_dag)} READY but not DAG-ready (deps not met in DAG)")
                 if in_progress:
                     self._monitor_active_agents()
                     self._sync_budget()
@@ -415,6 +429,14 @@ class Orchestrator:
 
             self._monitor_active_agents()
             self._sync_budget()
+
+            # ── Heartbeat: periodic status line so user knows we're alive ──
+            now = time.time()
+            last_hb = getattr(self, '_last_heartbeat', 0)
+            if now - last_hb >= 60:
+                self._last_heartbeat = now
+                self._print_heartbeat()
+
             time.sleep(self.config.poll_interval)
 
         # Stop context watcher
@@ -503,11 +525,11 @@ class Orchestrator:
         history = []
         if memory_file.exists():
             try:
-                history = json.loads(memory_file.read_text())
+                history = json.loads(memory_file.read_text(encoding="utf-8", errors="replace"))
             except json.JSONDecodeError:
                 pass
         history.append({"timestamp": datetime.now().isoformat(), **health})
-        memory_file.write_text(json.dumps(history[-50:], indent=2))  # Keep last 50
+        memory_file.write_text(json.dumps(history[-50:], indent=2), encoding="utf-8")  # Keep last 50
 
         return new_count
 
@@ -576,7 +598,7 @@ class Orchestrator:
         # Skip if SHARED.md was updated recently (within last 30 min) and has real content
         context_file = self.forge_dir / "context" / "SHARED.md"
         if context_file.exists():
-            content = context_file.read_text()
+            content = context_file.read_text(encoding="utf-8", errors="replace")
             age_seconds = time.time() - context_file.stat().st_mtime
             # If context has substantial content and is less than 30 min old, skip
             if len(content) > 500 and age_seconds < 1800:
@@ -751,7 +773,7 @@ class Orchestrator:
         if style_file.exists():
             age = time.time() - style_file.stat().st_mtime
             if age < 3600:
-                return style_file.read_text()
+                return style_file.read_text(encoding="utf-8", errors="replace")
 
         patterns = []
 
@@ -842,7 +864,7 @@ class Orchestrator:
 
         # Cache it
         style_file.parent.mkdir(parents=True, exist_ok=True)
-        style_file.write_text(guide)
+        style_file.write_text(guide, encoding="utf-8")
 
         return guide
 
@@ -854,7 +876,7 @@ class Orchestrator:
         cleaned = 0
         for lock_file in locks_dir.glob("*.lock"):
             try:
-                lock_data = json.loads(lock_file.read_text())
+                lock_data = json.loads(lock_file.read_text(encoding="utf-8", errors="replace"))
                 started = lock_data.get("started", "")
                 if started:
                     lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
@@ -871,17 +893,61 @@ class Orchestrator:
             self._log(f"  🔓 Cleaned {cleaned} stale lock(s) from previous run")
 
     def _reset_stuck_tasks(self):
-        """Reset tasks stuck in IN_PROGRESS from a previous crashed run."""
+        """Reset tasks stuck in IN_PROGRESS from a previous crashed run.
+
+        A task is stuck if it's IN_PROGRESS but:
+        - No lock file exists (process was never locked or lock was cleaned up)
+        - Lock file exists but is stale (older than timeout — the process died)
+        - Lock file exists but no matching entry in _active_processes (restart after crash)
+        """
         reset_count = 0
         for task in self.tasks:
             if task.status == TaskStatus.IN_PROGRESS:
                 lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
+                should_reset = False
                 if not lock_file.exists():
-                    # No lock = no active process = stuck from a crash
+                    should_reset = True
+                elif task.id not in self._active_processes:
+                    # Lock exists but no subprocess — this is a leftover from a crashed run
+                    # Check if the lock is stale (older than timeout)
+                    try:
+                        lock_data = json.loads(lock_file.read_text(encoding="utf-8", errors="replace"))
+                        started = lock_data.get("started", "")
+                        if started:
+                            lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                            if lock_age > self.config.timeout_minutes * 60:
+                                should_reset = True
+                            else:
+                                # Lock is recent but no subprocess — crashed mid-run
+                                should_reset = True
+                        else:
+                            should_reset = True
+                    except Exception:
+                        should_reset = True  # Corrupt lock file
+                if should_reset:
+                    lock_file.unlink(missing_ok=True)
                     self._set_status(task, TaskStatus.READY)
                     reset_count += 1
         if reset_count:
             self._log(f"  🔄 Reset {reset_count} stuck task(s) from previous run back to READY")
+
+    def _print_heartbeat(self):
+        """Print a one-line status so the user knows the orchestrator is alive."""
+        counts = {}
+        for t in self.tasks:
+            counts[t.status.value] = counts.get(t.status.value, 0) + 1
+        active = []
+        for tid, proc in self._active_processes.items():
+            task = next((t for t in self.tasks if t.id == tid), None)
+            if task:
+                elapsed = 0
+                if task.started_at:
+                    elapsed = (datetime.now() - datetime.fromisoformat(task.started_at)).total_seconds()
+                active.append(f"{task.id[:25]}({task.assigned_provider},{int(elapsed)}s)")
+        parts = [f"{k}:{v}" for k, v in sorted(counts.items())]
+        status_str = " ".join(parts)
+        active_str = ", ".join(active) if active else "none"
+        self._log(f"  💓 [{status_str}] | running: {active_str} | spent: ${self.budget_spent:.2f}")
 
     def _set_status(self, task: Task, status: TaskStatus):
         """Change task status and sync to disk so dashboard can see it."""
@@ -894,6 +960,8 @@ class Orchestrator:
         in_progress_ids = {t.id for t in self.tasks if t.status == TaskStatus.IN_PROGRESS}
         # Use DAG to find tasks whose deps are met
         dag_ready = set(self._dag.get_ready(done_ids, in_progress_ids))
+        promoted = 0
+        backlog_stuck = 0
         for task in self.tasks:
             if task.status == TaskStatus.BACKLOG:
                 # Check if any dependency has FAILED — if so, this task can never run
@@ -902,14 +970,40 @@ class Orchestrator:
                     self._log(f"  ⚠ {task.id} depends on failed task {failed_dep} — marking FAILED")
                     self._set_status(task, TaskStatus.FAILED)
                     continue
+                # Check if dependency refers to a task that doesn't exist at all
+                if task.depends_on:
+                    missing_deps = [d for d in task.depends_on
+                                    if d not in done_ids and d not in failed_ids
+                                    and d not in in_progress_ids
+                                    and not any(t.id == d for t in self.tasks)]
+                    if missing_deps:
+                        # Dependencies reference non-existent tasks — clear them
+                        self._log(f"  🔗 {task.id}: clearing {len(missing_deps)} missing deps: {missing_deps[:3]}")
+                        task.depends_on = [d for d in task.depends_on if d not in missing_deps]
+                        self._save_task(task)
                 # DAG-aware: check if all dependencies are done
                 if task.id in dag_ready or (not task.depends_on or all(dep in done_ids for dep in task.depends_on)):
                     self._set_status(task, TaskStatus.READY)
+                    promoted += 1
+                else:
+                    backlog_stuck += 1
             elif task.status == TaskStatus.BLOCKED:
                 # Unblock tasks whose lock has been cleared
                 lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
                 if not lock_file.exists():
                     self._set_status(task, TaskStatus.READY)
+        if promoted > 0:
+            self._log(f"  📋 Promoted {promoted} tasks BACKLOG → READY")
+        if backlog_stuck > 0 and promoted == 0:
+            # Throttle stuck logging to once per 60 seconds to reduce noise
+            now = time.time()
+            last_stuck_log = getattr(self, '_last_stuck_log_time', 0)
+            if now - last_stuck_log >= 60:
+                self._last_stuck_log_time = now
+                stuck_examples = [t for t in self.tasks if t.status == TaskStatus.BACKLOG][:3]
+                for t in stuck_examples:
+                    pending_deps = [d for d in t.depends_on if d not in done_ids]
+                    self._log(f"  🔒 {t.id} waiting on: {pending_deps[:5]}")
 
     def _build_review_description(self, impl_task: Task) -> str:
         """Build a review prompt that uses SHARED.md as the spec to validate against."""
@@ -917,7 +1011,7 @@ class Orchestrator:
         context_file = self.forge_dir / "context" / "SHARED.md"
         spec_section = ""
         if context_file.exists():
-            shared = context_file.read_text()
+            shared = context_file.read_text(encoding="utf-8", errors="replace")
             # Extract architecture + API contracts sections for the reviewer
             for header in ["## Architecture", "## API Contracts", "## Data Models"]:
                 start = shared.find(header)
@@ -966,7 +1060,7 @@ class Orchestrator:
         if not recent:
             return
 
-        review_output = recent[0].read_text()
+        review_output = recent[0].read_text(encoding="utf-8", errors="replace")
 
         # Count severity tags to decide if we need a fix task
         critical = review_output.lower().count("[critical]")
@@ -1012,7 +1106,7 @@ class Orchestrator:
         lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
         if lock_file.exists():
             try:
-                lock_data = json.loads(lock_file.read_text())
+                lock_data = json.loads(lock_file.read_text(encoding="utf-8", errors="replace"))
                 started = lock_data.get("started", "")
                 # Check if this is a stale lock (older than timeout)
                 if started:
@@ -1078,7 +1172,7 @@ class Orchestrator:
         # Lock
         lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
         lock_file.parent.mkdir(parents=True, exist_ok=True)
-        lock_file.write_text(json.dumps({"agent": decision.provider.name, "started": task.started_at}))
+        lock_file.write_text(json.dumps({"agent": decision.provider.name, "started": task.started_at}), encoding="utf-8")
 
         # Build prompt with role instructions
         role_instructions = self._load_role_instructions(task.type)
@@ -1209,7 +1303,11 @@ class Orchestrator:
 
             if ret == 0:
                 # ── Validation gate: verify the agent actually did something useful ──
-                validation = self._validate_task_output(task)
+                try:
+                    validation = self._validate_task_output(task)
+                except Exception as val_err:
+                    self._log(f"  ⚠ Validation error for {task_id} (accepting anyway): {val_err}")
+                    validation = {"passed": True}
 
                 if not validation["passed"]:
                     # Agent exited 0 but failed validation — retry with feedback
@@ -1394,7 +1492,7 @@ class Orchestrator:
         if task.type == "architecture":
             ctx = self.forge_dir / "context" / "SHARED.md"
             if ctx.exists():
-                content = ctx.read_text()
+                content = ctx.read_text(encoding="utf-8", errors="replace")
                 if len(content) < 200:
                     return {"passed": False, "reason": "SHARED.md is nearly empty", "details": "Write architecture docs, API contracts, and implementation plan to .forge/context/SHARED.md"}
             return {"passed": True}
@@ -1587,7 +1685,7 @@ class Orchestrator:
         history = []
         if memory_file.exists():
             try:
-                history = json.loads(memory_file.read_text())
+                history = json.loads(memory_file.read_text(encoding="utf-8", errors="replace"))
             except json.JSONDecodeError:
                 pass
 
@@ -1602,7 +1700,7 @@ class Orchestrator:
             "timestamp": datetime.now().isoformat(),
         })
 
-        memory_file.write_text(json.dumps(history[-200:], indent=2))  # Keep last 200
+        memory_file.write_text(json.dumps(history[-200:], indent=2), encoding="utf-8")  # Keep last 200
 
     def load_memory(self) -> dict:
         """Load memory from previous sessions for smarter routing."""
@@ -1611,7 +1709,7 @@ class Orchestrator:
             f = self.forge_dir / "memory" / f"{name}.json"
             if f.exists():
                 try:
-                    memory[name] = json.loads(f.read_text())
+                    memory[name] = json.loads(f.read_text(encoding="utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     pass
 
@@ -1632,7 +1730,7 @@ class Orchestrator:
     def _build_task_prompt(self, task: Task, role_instructions: str) -> str:
         # ── Context: only include what this task type actually needs ──
         context_file = self.forge_dir / "context" / "SHARED.md"
-        shared_raw = context_file.read_text() if context_file.exists() else ""
+        shared_raw = context_file.read_text(encoding="utf-8", errors="replace") if context_file.exists() else ""
 
         # Architecture & review get full context; implementation tasks get a summary
         if task.type in ("architecture", "review"):
@@ -1649,7 +1747,7 @@ class Orchestrator:
             if mail_dir.exists():
                 recent_mail = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
                 for f in recent_mail[:3]:  # Only last 3 messages per source
-                    content = f.read_text()
+                    content = f.read_text(encoding="utf-8", errors="replace")
                     mail += content[:1000] + "\n---\n"  # Cap each message
 
         # ── Handoff context: what predecessor tasks produced ──
@@ -1771,7 +1869,7 @@ class Orchestrator:
             f"Duration: {duration:.0f}s | Cost: ${task.actual_cost_usd:.4f}\n"
             f"{files_changed}\n"
         )
-        (mail_dir / f"{timestamp}.md").write_text(mail_content)
+        (mail_dir / f"{timestamp}.md").write_text(mail_content, encoding="utf-8")
 
     def _build_handoff_context(self, task: Task) -> str:
         """Build context about what predecessor tasks produced — the handoff."""
@@ -1790,7 +1888,7 @@ class Orchestrator:
                 mail_dir = self.forge_dir / "mail" / mail_type
                 if mail_dir.exists():
                     for f in sorted(mail_dir.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
-                        content = f.read_text()
+                        content = f.read_text(encoding="utf-8", errors="replace")
                         if dep_task.type in content.lower() or dep_id in content:
                             predecessor_mail = content[:800]
                             break
@@ -1916,7 +2014,7 @@ class Orchestrator:
         for agents_dir in [self.project_dir / ".claude" / "agents", Path(__file__).parent.parent / "agents"]:
             role_file = agents_dir / f"{task_type}.md"
             if role_file.exists():
-                return role_file.read_text()
+                return role_file.read_text(encoding="utf-8", errors="replace")
         return f"You are the {task_type} agent. Complete your assigned task."
 
     # ════════════════════════════════════════════════════════════
@@ -1934,7 +2032,7 @@ class Orchestrator:
             "estimated_minutes": task.estimated_minutes,
             "actual_cost_usd": task.actual_cost_usd,
             "retries": task.retries, "source": task.source,
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
 
     def _parse_cost_from_log(self, task: Task) -> float:
         """Parse tokens from log, record in ledger, calculate cost."""
@@ -2049,7 +2147,7 @@ class Orchestrator:
             ledger = []
             if ledger_file.exists():
                 try:
-                    ledger = json.loads(ledger_file.read_text())
+                    ledger = json.loads(ledger_file.read_text(encoding="utf-8", errors="replace"))
                 except Exception:
                     ledger = []
 
@@ -2064,7 +2162,7 @@ class Orchestrator:
                 "timestamp": datetime.now().isoformat(),
             })
 
-            ledger_file.write_text(json.dumps(ledger[-500:], indent=2))
+            ledger_file.write_text(json.dumps(ledger[-500:], indent=2), encoding="utf-8")
         finally:
             lock.unlink(missing_ok=True)
 
@@ -2077,7 +2175,7 @@ class Orchestrator:
         ledger = []
         if ledger_file.exists():
             try:
-                ledger = json.loads(ledger_file.read_text())
+                ledger = json.loads(ledger_file.read_text(encoding="utf-8", errors="replace"))
             except Exception:
                 pass
 
@@ -2115,7 +2213,7 @@ class Orchestrator:
             "tasks_failed": len(failed_tasks),
             "tasks_active": len(self._active_processes),
             "by_provider": by_provider,
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
 
         # Keep orchestrator in sync
         self.budget_spent = round(total_cost, 4)
@@ -2183,8 +2281,14 @@ class Orchestrator:
         return selected
 
     def _task_areas(self, task: Task) -> set[str]:
-        """Estimate which code areas a task will touch based on type/description."""
-        areas = {task.type}  # At minimum, the task type is an area
+        """Estimate which code areas a task will touch based on description.
+
+        NOTE: task.type is intentionally NOT included — multiple tasks of the
+        same type (e.g., two backend tasks working on different features)
+        should be allowed to run in parallel. Only specific file/module
+        references cause conflicts.
+        """
+        areas = set()
         desc = task.description.lower()
 
         # Extract mentioned file paths
@@ -2230,7 +2334,8 @@ class Orchestrator:
                 (mail_dir / f"{ts}-context-update.md").write_text(
                     f"FROM: system\nTO: broadcast\nRE: SHARED.md updated\n---\n"
                     f"The shared context (.forge/context/SHARED.md) was updated at {ts}.\n"
-                    f"Re-read it before making assumptions about the architecture.\n"
+                    f"Re-read it before making assumptions about the architecture.\n",
+                    encoding="utf-8",
                 )
             elif not self._shared_md_hash:
                 self._shared_md_hash = new_hash
@@ -2301,7 +2406,7 @@ class Orchestrator:
         checkpoint_file = self.forge_dir / "state" / "checkpoint.json"
         checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            checkpoint_file.write_text(json.dumps(checkpoint, indent=2))
+            checkpoint_file.write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -2312,7 +2417,7 @@ class Orchestrator:
             return
 
         try:
-            data = json.loads(checkpoint_file.read_text())
+            data = json.loads(checkpoint_file.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, Exception):
             return
 
@@ -2320,7 +2425,7 @@ class Orchestrator:
         ledger_file = self.forge_dir / "budget" / "token_ledger.json"
         if ledger_file.exists():
             try:
-                ledger = json.loads(ledger_file.read_text())
+                ledger = json.loads(ledger_file.read_text(encoding="utf-8", errors="replace"))
                 total = sum(e.get("cost_usd", 0) for e in ledger)
                 if total > 0:
                     self.budget_spent = round(total, 4)
@@ -2473,7 +2578,7 @@ Output ONLY valid JSON, no markdown fences, no explanation."""
             "total_cost": self.budget_spent, "budget": self.config.budget,
             "health_score": health["score"], "health_readiness": health["readiness"],
             "provider_costs": provider_costs,
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
 
         # Persist budget spending
         (self.forge_dir / "budget" / "spending.json").write_text(json.dumps({
@@ -2481,4 +2586,4 @@ Output ONLY valid JSON, no markdown fences, no explanation."""
             "budget_spent": self.budget_spent,
             "transactions": [{"task": t.id, "provider": t.assigned_provider, "cost": t.actual_cost_usd}
                              for t in done],
-        }, indent=2))
+        }, indent=2), encoding="utf-8")

@@ -90,7 +90,7 @@ class DiscoveryEngine:
         if not vision_file.exists():
             return items
 
-        vision_text = vision_file.read_text()
+        vision_text = vision_file.read_text(encoding="utf-8", errors="replace")
 
         # --- Parse unchecked checklist items: "- [ ] something" ---
         checklist_items = re.findall(r'-\s*\[\s*\]\s*(.+)', vision_text)
@@ -519,7 +519,7 @@ class DiscoveryEngine:
         if tasks_dir.exists():
             for f in tasks_dir.glob("*.json"):
                 try:
-                    data = json.loads(f.read_text())
+                    data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
                     titles.add(data.get("title", ""))
                 except (json.JSONDecodeError, KeyError):
                     pass
@@ -646,7 +646,7 @@ class DiscoveryEngine:
             doc_score += 5
             # Bonus: README has meaningful content (>500 chars)
             try:
-                readme_len = len((self.project_dir / "README.md").read_text())
+                readme_len = len((self.project_dir / "README.md").read_text(encoding="utf-8", errors="replace"))
                 if readme_len > 500:
                     doc_score += 3
             except Exception:
@@ -668,7 +668,7 @@ class DiscoveryEngine:
         if tasks_dir.exists():
             for f in tasks_dir.glob("*.json"):
                 try:
-                    data = json.loads(f.read_text())
+                    data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
                     task_total += 1
                     if data.get("status") == "done":
                         task_done += 1

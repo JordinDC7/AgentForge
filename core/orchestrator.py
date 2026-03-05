@@ -168,7 +168,9 @@ class Orchestrator:
 
     def init_forge(self):
         """Initialize .forge/ directory structure."""
-        for d in ["tasks", "mail", "locks", "logs", "context", "budget", "memory"]:
+        for d in ["tasks", "locks", "logs", "context", "budget", "memory",
+                  "mail/architecture", "mail/backend", "mail/frontend",
+                  "mail/testing", "mail/review", "mail/docs", "mail/broadcast"]:
             (self.forge_dir / d).mkdir(parents=True, exist_ok=True)
 
         for name, default in [
@@ -221,8 +223,9 @@ class Orchestrator:
             self._log(f"\n📡 {reason}. Running discovery...")
             self._run_discovery_cycle()
 
-        # Clean up stale locks from previous runs
+        # Clean up stale locks and stuck tasks from previous runs
         self._cleanup_stale_locks()
+        self._reset_stuck_tasks()
 
         # Always create an architecture assessment task at the start
         # This ensures Claude Sonnet runs to review the codebase and update shared context
@@ -272,6 +275,10 @@ class Orchestrator:
             if self._tasks_completed_since_discovery >= self.config.discovery_interval:
                 self._run_discovery_cycle()
                 self._tasks_completed_since_discovery = 0
+                # Re-run architecture to update SHARED.md with what was built
+                self._inject_architecture_task()
+                # Inject docs task if we've done enough implementation work
+                self._inject_docs_task()
 
             # ── Find and dispatch ready tasks ──
             ready = [t for t in self.tasks if t.status == TaskStatus.READY]
@@ -457,11 +464,11 @@ class Orchestrator:
 
     def _inject_review_tasks(self):
         """Create review tasks for implementation work in the queue."""
-        impl_tasks = [t for t in self.tasks 
-                      if t.type in ("backend", "frontend") 
+        impl_tasks = [t for t in self.tasks
+                      if t.type in ("backend", "frontend")
                       and t.status in (TaskStatus.READY, TaskStatus.BACKLOG)]
         existing_reviews = {t.title for t in self.tasks if t.type == "review"}
-        
+
         for impl_task in impl_tasks[:3]:  # Cap at 3 reviews per cycle
             review_title = f"Review: {impl_task.title[:60]}"
             if review_title in existing_reviews:
@@ -470,19 +477,47 @@ class Orchestrator:
                 id=f"review-{impl_task.id}",
                 type="review",
                 title=review_title,
-                description=(
-                    f"Review the code for: {impl_task.title}\n\n"
-                    f"After the implementation agent finishes, review its changes.\n"
-                    f"Check for: bugs, edge cases, missing error handling, test coverage, "
-                    f"code style, and security issues. Fix any issues you find directly.\n"
-                    f"Update .forge/context/SHARED.md if you discover architectural concerns."
-                ),
+                description=self._build_review_description(impl_task),
                 status=TaskStatus.BACKLOG,
                 depends_on=[impl_task.id],
                 priority=65,
                 source="review",
             )
             self.add_task(review_task)
+
+    def _inject_docs_task(self):
+        """Create a docs task after enough implementation work is done."""
+        # Skip if there's already a pending docs task
+        if any(t.type == "docs" and t.status not in (TaskStatus.DONE, TaskStatus.FAILED) for t in self.tasks):
+            return
+
+        # Only inject if we have completed implementation tasks to document
+        completed_impl = [t for t in self.tasks
+                          if t.type in ("backend", "frontend") and t.status == TaskStatus.DONE]
+        if len(completed_impl) < 2:
+            return  # Wait until there's enough to document
+
+        # Build a description of what was implemented
+        impl_summary = "\n".join(f"- {t.title}" for t in completed_impl[-5:])
+
+        docs_task = Task(
+            id=f"docs-{int(time.time())}",
+            type="docs",
+            title="Update documentation for recent changes",
+            description=(
+                f"Recent implementation work that needs documentation:\n{impl_summary}\n\n"
+                "1. Update README.md with any new features, setup steps, or config options\n"
+                "2. Add docstrings to new public functions/classes\n"
+                "3. Update .forge/context/SHARED.md if architecture has changed\n"
+                "4. Add usage examples where helpful\n\n"
+                "Read the code changes and make docs match reality."
+            ),
+            status=TaskStatus.READY,
+            priority=40,
+            source="system",
+        )
+        self.add_task(docs_task)
+        self._log(f"  📄 Created docs task for {len(completed_impl)} implemented features")
 
     def _cleanup_stale_locks(self):
         """Remove lock files from previous runs that no longer have active processes."""
@@ -508,6 +543,19 @@ class Orchestrator:
         if cleaned:
             self._log(f"  🔓 Cleaned {cleaned} stale lock(s) from previous run")
 
+    def _reset_stuck_tasks(self):
+        """Reset tasks stuck in IN_PROGRESS from a previous crashed run."""
+        reset_count = 0
+        for task in self.tasks:
+            if task.status == TaskStatus.IN_PROGRESS:
+                lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
+                if not lock_file.exists():
+                    # No lock = no active process = stuck from a crash
+                    self._set_status(task, TaskStatus.READY)
+                    reset_count += 1
+        if reset_count:
+            self._log(f"  🔄 Reset {reset_count} stuck task(s) from previous run back to READY")
+
     def _set_status(self, task: Task, status: TaskStatus):
         """Change task status and sync to disk so dashboard can see it."""
         task.status = status
@@ -524,6 +572,96 @@ class Orchestrator:
                 lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
                 if not lock_file.exists():
                     self._set_status(task, TaskStatus.READY)
+
+    def _build_review_description(self, impl_task: Task) -> str:
+        """Build a review prompt that uses SHARED.md as the spec to validate against."""
+        # Pull API contracts and architecture from SHARED.md as ground truth
+        context_file = self.forge_dir / "context" / "SHARED.md"
+        spec_section = ""
+        if context_file.exists():
+            shared = context_file.read_text()
+            # Extract architecture + API contracts sections for the reviewer
+            for header in ["## Architecture", "## API Contracts", "## Data Models"]:
+                start = shared.find(header)
+                if start != -1:
+                    # Find the next ## header or end of file
+                    next_header = shared.find("\n## ", start + len(header))
+                    section = shared[start:next_header] if next_header != -1 else shared[start:]
+                    spec_section += section.strip() + "\n\n"
+
+        spec_block = ""
+        if spec_section:
+            spec_block = (
+                "\n## Architecture Spec (from SHARED.md — this is the source of truth)\n"
+                f"{spec_section[:3000]}\n"
+                "Verify the implementation matches these contracts. Flag any deviations.\n"
+            )
+
+        return (
+            f"Review the code for: {impl_task.title}\n\n"
+            f"Task ID: {impl_task.id}\n"
+            f"Provider: {impl_task.assigned_provider}\n"
+            f"Branch: {impl_task.branch}\n"
+            f"{spec_block}\n"
+            "## Review Checklist\n"
+            "1. **Spec compliance**: Does it match the architecture and API contracts above?\n"
+            "2. **Correctness**: Logic errors, off-by-ones, race conditions\n"
+            "3. **Security**: Input validation, injection risks, auth checks, hardcoded secrets\n"
+            "4. **Error handling**: Missing try/catch, unhelpful error messages, silent failures\n"
+            "5. **Performance**: N+1 queries, unnecessary loops, missing indexes\n"
+            "6. **Test coverage**: Are edge cases tested? Is behavior tested, not implementation?\n\n"
+            "## Output\n"
+            "- Fix issues directly in the code where possible.\n"
+            "- For architectural concerns, update .forge/context/SHARED.md.\n"
+            "- Write a summary to .forge/mail/review/ listing what you fixed and what needs attention.\n"
+            "  Use format: `[CRITICAL]`, `[MAJOR]`, `[MINOR]` severity tags.\n"
+        )
+
+    def _create_fix_tasks_from_review(self, review_task: Task):
+        """After a review completes, scan its mail output for issues and create fix tasks."""
+        mail_dir = self.forge_dir / "mail" / "review"
+        if not mail_dir.exists():
+            return
+
+        # Find the most recent review mail (likely from this review)
+        recent = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not recent:
+            return
+
+        review_output = recent[0].read_text()
+
+        # Count severity tags to decide if we need a fix task
+        critical = review_output.lower().count("[critical]")
+        major = review_output.lower().count("[major]")
+
+        if critical + major == 0:
+            return  # Clean review, no follow-up needed
+
+        # Extract the original task ID from the review task
+        original_id = review_task.id.replace("review-", "", 1)
+        fix_id = f"fix-{original_id}"
+
+        if any(t.id == fix_id for t in self.tasks):
+            return  # Already have a fix task
+
+        fix_task = Task(
+            id=fix_id,
+            type="backend",  # Fixes go back to implementation
+            title=f"Fix: {critical} critical, {major} major issues from review",
+            description=(
+                f"The code reviewer found issues that need fixing.\n\n"
+                f"Review findings (from .forge/mail/review/):\n"
+                f"{review_output[:3000]}\n\n"
+                f"Fix all [CRITICAL] and [MAJOR] issues. [MINOR] issues are optional.\n"
+                f"Run tests after fixing to ensure nothing is broken."
+            ),
+            status=TaskStatus.READY,
+            priority=85,  # High priority — fixes should happen before new features
+            source="review-fix",
+            branch=review_task.branch or "",
+        )
+        self.add_task(fix_task)
+        self._log(f"  🔧 Created fix task for {critical} critical + {major} major review findings")
 
     def _dispatch_task(self, task: Task):
         self._log(f"\n🚀 Dispatching: {task.id} ({task.type}) — {task.title[:50]}")
@@ -725,33 +863,52 @@ class Orchestrator:
             self.budget_spent += cost
 
             if ret == 0:
-                self._set_status(task, TaskStatus.DONE)
-                task.completed_at = datetime.now().isoformat()
-                self._tasks_completed_since_discovery += 1
-                self._log(f"  ✅ {task_id} DONE (${cost:.4f} [{cost_source}], {duration:.0f}s, {task.assigned_provider})")
-                self._save_to_memory(task, success=True)
+                # ── Validation gate: verify the agent actually did something useful ──
+                validation = self._validate_task_output(task)
+
+                if not validation["passed"]:
+                    # Agent exited 0 but failed validation — retry with feedback
+                    task.retries += 1
+                    if task.retries < task.max_retries:
+                        self._log(f"  ⚠ {task_id} passed but failed validation: {validation['reason']}")
+                        self._log(f"    Retrying ({task.retries}/{task.max_retries}) with validation feedback...")
+                        # Inject failure context into the task description for the retry
+                        task.description += (
+                            f"\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\n"
+                            f"Reason: {validation['reason']}\n"
+                            f"{validation.get('details', '')}\n"
+                            f"Fix the issues above and try again.\n"
+                        )
+                        self._set_status(task, TaskStatus.READY)
+                        self._save_to_memory(task, success=False)
+                    else:
+                        self._log(f"  ❌ {task_id} failed validation after {task.max_retries} attempts: {validation['reason']}")
+                        self._set_status(task, TaskStatus.DONE)  # Accept imperfect work
+                        task.completed_at = datetime.now().isoformat()
+                        self._tasks_completed_since_discovery += 1
+                        self._save_to_memory(task, success=True)
+                        self._write_completion_handoff(task, duration)
+                else:
+                    self._set_status(task, TaskStatus.DONE)
+                    task.completed_at = datetime.now().isoformat()
+                    self._tasks_completed_since_discovery += 1
+                    self._log(f"  ✅ {task_id} DONE (${cost:.4f} [{cost_source}], {duration:.0f}s, {task.assigned_provider})")
+                    self._save_to_memory(task, success=True)
+                    self._write_completion_handoff(task, duration)
 
                 # Auto-merge the agent's branch back to main
-                if task.branch:
+                if task.status == TaskStatus.DONE and task.branch:
                     self._try_auto_merge(task)
 
                 # Auto-create review task for completed work (except reviews themselves)
-                if task.type not in ("review", "docs", "architecture") and task.source != "review":
+                if task.status == TaskStatus.DONE and task.type not in ("review", "docs", "architecture") and task.source != "review":
                     review_id = f"review-{task.id}"
                     if not any(t.id == review_id for t in self.tasks):
                         review_task = Task(
                             id=review_id,
                             type="review",
                             title=f"Review: {task.title[:60]}",
-                            description=(
-                                f"Review the code changes from task {task.id}.\n"
-                                f"Original task: {task.title}\n"
-                                f"Provider: {task.assigned_provider}\n"
-                                f"Branch: {task.branch}\n\n"
-                                f"Check for: bugs, edge cases, missing error handling, test coverage, "
-                                f"code style, and security issues. If issues found, fix them directly.\n"
-                                f"Update .forge/context/SHARED.md with any architectural notes."
-                            ),
+                            description=self._build_review_description(task),
                             status=TaskStatus.READY,
                             priority=65,
                             source="review",
@@ -759,10 +916,23 @@ class Orchestrator:
                         )
                         self.add_task(review_task)
                         self._log(f"  📝 Created review task → routes to Claude Sonnet")
+
+                # After review completes, check if it flagged issues → create fix tasks
+                if task.status == TaskStatus.DONE and task.type == "review":
+                    self._create_fix_tasks_from_review(task)
             else:
+                # ── Agent crashed (non-zero exit) — retry with error context ──
                 task.retries += 1
+                error_context = self._extract_error_from_log(task)
                 if task.retries < task.max_retries:
                     self._log(f"  ⚠ {task_id} FAILED (retry {task.retries}/{task.max_retries}) — escalating")
+                    if error_context:
+                        task.description += (
+                            f"\n\n## PREVIOUS ATTEMPT CRASHED\n"
+                            f"Exit code: {ret}\n"
+                            f"Error output:\n```\n{error_context}\n```\n"
+                            f"Do NOT repeat the same approach. Fix the error.\n"
+                        )
                     self._set_status(task, TaskStatus.READY)
                     task.complexity = TaskComplexity.HARD  # Triggers escalation
                     self._save_to_memory(task, success=False)
@@ -778,6 +948,105 @@ class Orchestrator:
 
         for tid in completed:
             self._active_processes.pop(tid, None)
+
+    def _validate_task_output(self, task: Task) -> dict:
+        """Validate that the agent actually produced useful output before marking done."""
+        # Architecture tasks: check that SHARED.md was updated
+        if task.type == "architecture":
+            ctx = self.forge_dir / "context" / "SHARED.md"
+            if ctx.exists():
+                content = ctx.read_text()
+                if len(content) < 200:
+                    return {"passed": False, "reason": "SHARED.md is nearly empty", "details": "Write architecture docs, API contracts, and implementation plan to .forge/context/SHARED.md"}
+            return {"passed": True}
+
+        # Implementation tasks: check that files were actually changed
+        if task.type in ("backend", "frontend") and task.branch:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"main...{task.branch}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    changed = [f for f in result.stdout.strip().split("\n") if f.strip()]
+                    if not changed:
+                        return {"passed": False, "reason": "No files were changed", "details": "You must write code and commit it to your branch."}
+            except Exception:
+                pass
+
+            # Run tests if a test runner is detected
+            test_result = self._run_test_gate(task)
+            if test_result and not test_result["passed"]:
+                return test_result
+
+        # Testing tasks: check that test files were created
+        if task.type == "testing" and task.branch:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"main...{task.branch}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    changed = result.stdout.strip().split("\n")
+                    test_files = [f for f in changed if "test" in f.lower()]
+                    if not test_files:
+                        return {"passed": False, "reason": "No test files were created or modified", "details": "Write tests in test files."}
+            except Exception:
+                pass
+
+        return {"passed": True}
+
+    def _run_test_gate(self, task: Task) -> Optional[dict]:
+        """Run tests after agent completes. Returns None if no test runner found."""
+        # Detect test runner
+        runners = [
+            (self.project_dir / "package.json", ["npm", "test"]),
+            (self.project_dir / "pytest.ini", ["pytest", "--tb=short", "-q"]),
+            (self.project_dir / "pyproject.toml", ["pytest", "--tb=short", "-q"]),
+            (self.project_dir / "setup.py", ["pytest", "--tb=short", "-q"]),
+        ]
+
+        cmd = None
+        for marker, test_cmd in runners:
+            if marker.exists():
+                cmd = test_cmd
+                break
+
+        if not cmd:
+            return None  # No test runner found — skip
+
+        try:
+            result = subprocess.run(
+                cmd, cwd=self.project_dir, capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                # Extract last 30 lines of test output
+                output = (result.stdout + result.stderr).strip()
+                last_lines = "\n".join(output.split("\n")[-30:])
+                return {
+                    "passed": False,
+                    "reason": "Tests failed after your changes",
+                    "details": f"Test output:\n```\n{last_lines}\n```\nFix the failing tests before marking done.",
+                }
+        except subprocess.TimeoutExpired:
+            return {"passed": False, "reason": "Tests timed out (>2min)", "details": "Tests are hanging. Check for infinite loops."}
+        except FileNotFoundError:
+            return None  # Test runner not installed — skip
+
+        return {"passed": True}
+
+    def _extract_error_from_log(self, task: Task) -> str:
+        """Extract the last ~20 lines from an agent's log for error context on retries."""
+        log_dir = self.forge_dir / "logs"
+        log_files = list(log_dir.glob(f"{task.id}_*.log"))
+        if not log_files:
+            return ""
+        try:
+            content = log_files[0].read_text(errors="replace")
+            lines = content.strip().split("\n")
+            return "\n".join(lines[-20:])
+        except Exception:
+            return ""
 
     def _try_auto_merge(self, task: Task):
         """Try to merge the agent's branch back to main. Skip on conflict."""
@@ -880,14 +1149,19 @@ class Orchestrator:
             # Extract only the sections relevant to this task type
             shared = self._extract_relevant_context(shared_raw, task.type)
 
-        # ── Mail: only recent, relevant messages (not entire history) ──
+        # ── Mail: messages addressed to this agent type + broadcast ──
         mail = ""
-        mail_dir = self.forge_dir / "mail" / task.type
-        if mail_dir.exists():
-            recent_mail = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-            for f in recent_mail[:3]:  # Only last 3 messages, not all
-                content = f.read_text()
-                mail += content[:1000] + "\n---\n"  # Cap each message
+        mail_sources = [task.type, "broadcast"]
+        for source in mail_sources:
+            mail_dir = self.forge_dir / "mail" / source
+            if mail_dir.exists():
+                recent_mail = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+                for f in recent_mail[:3]:  # Only last 3 messages per source
+                    content = f.read_text()
+                    mail += content[:1000] + "\n---\n"  # Cap each message
+
+        # ── Handoff context: what predecessor tasks produced ──
+        handoff = self._build_handoff_context(task)
 
         # ── Memory hints: only if actually relevant ──
         memory_hint = ""
@@ -911,6 +1185,9 @@ class Orchestrator:
         if task.type in ("backend", "frontend", "testing") and task.description:
             file_hint = self._suggest_relevant_files(task)
 
+        # ── Active task board summary ──
+        board = self._build_task_board_summary(task)
+
         return f"""# Task: {task.title}
 ## ID: {task.id} | Type: {task.type} | Branch: {task.branch}
 
@@ -918,11 +1195,13 @@ class Orchestrator:
 {task.description}
 {file_hint}
 {diff_context}
+{handoff}
 
 ## Shared Context
 {shared}
-{"## Messages" + chr(10) + mail if mail else ""}
+{"## Messages from Other Agents" + chr(10) + mail if mail else ""}
 {memory_hint}
+{board}
 
 ## Role Instructions
 {role_instructions}
@@ -933,13 +1212,133 @@ class Orchestrator:
 - No lint errors introduced
 - Exit 0 when done, exit 1 if stuck
 
-## Rules
+## Communication Rules
 1. Work on branch: {task.branch}
 2. Run tests before committing. Fix failures.
-3. Write to .forge/mail/<agent-type>/<timestamp>.md to message other agents.
-4. Update .forge/context/SHARED.md with decisions.
-5. Exit 0 when done. Exit 1 if stuck.
+3. **Sending mail to other agents:**
+   - To a specific agent type: write to `.forge/mail/<type>/<timestamp>.md`
+     Types: architecture, backend, frontend, testing, review
+   - To ALL agents: write to `.forge/mail/broadcast/<timestamp>.md`
+   - Use timestamp format: `YYYYMMDD-HHMMSS`
+4. **Mail format** (so other agents can parse it):
+   ```
+   FROM: {task.type}
+   TO: <target-type or broadcast>
+   RE: <one-line subject>
+   ---
+   <your message>
+   ```
+5. **When to send mail:**
+   - When you complete your task (notify the next agent in the pipeline)
+   - When you discover something that affects another agent's work
+   - When you're blocked and need input from another agent type
+6. Update .forge/context/SHARED.md with architectural decisions or API changes.
+7. Exit 0 when done. Exit 1 if stuck.
 """
+
+    def _write_completion_handoff(self, task: Task, duration: float):
+        """Write a handoff mail when a task completes so downstream agents know what was done."""
+        # Determine who needs to know
+        pipeline = {
+            "architecture": "broadcast",
+            "backend": "testing",
+            "frontend": "testing",
+            "testing": "review",
+            "review": "broadcast",
+        }
+        target = pipeline.get(task.type, "broadcast")
+        mail_dir = self.forge_dir / "mail" / target
+        mail_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get list of files changed (from git)
+        files_changed = ""
+        if task.branch:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"main...{task.branch}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    files_changed = "\nFiles changed:\n" + "\n".join(
+                        f"  - {f}" for f in result.stdout.strip().split("\n")[:20]
+                    )
+            except Exception:
+                pass
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        mail_content = (
+            f"FROM: {task.type}\n"
+            f"TO: {target}\n"
+            f"RE: Task complete — {task.title[:60]}\n"
+            f"---\n"
+            f"Task `{task.id}` is done.\n"
+            f"Provider: {task.assigned_provider}\n"
+            f"Branch: {task.branch}\n"
+            f"Duration: {duration:.0f}s | Cost: ${task.actual_cost_usd:.4f}\n"
+            f"{files_changed}\n"
+        )
+        (mail_dir / f"{timestamp}.md").write_text(mail_content)
+
+    def _build_handoff_context(self, task: Task) -> str:
+        """Build context about what predecessor tasks produced — the handoff."""
+        if not task.depends_on:
+            return ""
+
+        handoff_parts = []
+        for dep_id in task.depends_on:
+            dep_task = next((t for t in self.tasks if t.id == dep_id), None)
+            if not dep_task or dep_task.status != TaskStatus.DONE:
+                continue
+
+            # Check if the predecessor left a mail message
+            predecessor_mail = ""
+            for mail_type in [task.type, "broadcast"]:
+                mail_dir = self.forge_dir / "mail" / mail_type
+                if mail_dir.exists():
+                    for f in sorted(mail_dir.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
+                        content = f.read_text()
+                        if dep_task.type in content.lower() or dep_id in content:
+                            predecessor_mail = content[:800]
+                            break
+                if predecessor_mail:
+                    break
+
+            summary = f"- **{dep_task.title}** ({dep_task.type}) — completed by {dep_task.assigned_provider}"
+            if dep_task.branch:
+                summary += f" on branch `{dep_task.branch}`"
+            if predecessor_mail:
+                summary += f"\n  Handoff note:\n  > {predecessor_mail[:300]}"
+            handoff_parts.append(summary)
+
+        if not handoff_parts:
+            return ""
+
+        return "\n## Predecessor Tasks (completed before you)\n" + "\n".join(handoff_parts) + "\n"
+
+    def _build_task_board_summary(self, task: Task) -> str:
+        """Give agents awareness of the overall project state."""
+        done = [t for t in self.tasks if t.status == TaskStatus.DONE]
+        in_progress = [t for t in self.tasks if t.status == TaskStatus.IN_PROGRESS]
+        ready = [t for t in self.tasks if t.status == TaskStatus.READY and t.id != task.id]
+
+        if not done and not in_progress and not ready:
+            return ""
+
+        lines = ["\n## Project Status Board"]
+        if done:
+            lines.append(f"Completed ({len(done)}):")
+            for t in done[-5:]:  # Last 5 completed
+                lines.append(f"  - ✅ {t.title[:50]} ({t.type}, by {t.assigned_provider})")
+        if in_progress:
+            lines.append(f"In Progress ({len(in_progress)}):")
+            for t in in_progress:
+                lines.append(f"  - 🔄 {t.title[:50]} ({t.type}, by {t.assigned_provider})")
+        if ready:
+            lines.append(f"Up Next ({len(ready)}):")
+            for t in ready[:3]:
+                lines.append(f"  - 📋 {t.title[:50]} ({t.type})")
+
+        return "\n".join(lines) + "\n"
 
     def _extract_relevant_context(self, shared: str, task_type: str) -> str:
         """Extract only the sections of SHARED.md relevant to this task type."""

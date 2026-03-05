@@ -38,8 +38,19 @@ What we're choosing and why
 
 ## Communication
 - Write specs to: `.forge/context/SHARED.md`
-- Send mail to: `.forge/mail/backend/` and `.forge/mail/frontend/` when specs are ready
-- Mail format: Create a file like `.forge/mail/backend/<timestamp>.md`
+- **Read** your mail: `.forge/mail/architecture/` and `.forge/mail/broadcast/`
+- **Send** mail using this format:
+  ```
+  FROM: architecture
+  TO: <target>
+  RE: <subject>
+  ---
+  <message>
+  ```
+- **When to send mail:**
+  - To `backend` and `frontend` when specs are ready (separate mails)
+  - To `broadcast` when you change a shared contract or data model
+  - Include a summary of what changed so agents don't have to re-read all of SHARED.md
 
 ## Rules
 - Do NOT write implementation code. Design only.

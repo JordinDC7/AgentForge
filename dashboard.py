@@ -149,20 +149,29 @@ def get_git_branches():
 def build_api_response():
     tasks = get_tasks()
     locks = get_locks()
-
-    # Cross-reference: if a lock exists for a task, it's active regardless of saved status
     locked_ids = set(locks.keys())
+
     for t in tasks:
-        if t.get("id") in locked_ids and t.get("status") not in ("done", "failed"):
-            t["status"] = "in_progress"
-            lock_info = locks.get(t["id"], {})
-            if not t.get("assigned_provider") and lock_info.get("agent"):
+        tid = t.get("id", "")
+
+        # Fill in provider from lock data if missing
+        if not t.get("assigned_provider") and tid in locked_ids:
+            lock_info = locks.get(tid, {})
+            if lock_info.get("agent"):
                 t["assigned_provider"] = lock_info["agent"]
+
+        # Task says in_progress but has no lock → stale from a crashed run → mark ready
+        if t.get("status") == "in_progress" and tid not in locked_ids:
+            t["status"] = "ready"
+
+        # Lock exists + not done/failed → actively running
+        if tid in locked_ids and t.get("status") not in ("done", "failed"):
+            t["status"] = "in_progress"
 
     active = [t for t in tasks if t.get("status") == "in_progress"]
     done = [t for t in tasks if t.get("status") == "done"]
     failed = [t for t in tasks if t.get("status") == "failed"]
-    ready = [t for t in tasks if t.get("status") in ("ready", "backlog")]
+    ready = [t for t in tasks if t.get("status") in ("ready", "backlog", "blocked")]
 
     return {
         "project": PROJECT_DIR.name,

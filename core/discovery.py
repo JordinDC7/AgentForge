@@ -403,7 +403,7 @@ class DiscoveryEngine:
         return items[:10]
 
     def _scan_missing_docs(self) -> list[DiscoveredWork]:
-        """Check for missing README, docstrings, etc."""
+        """Check for missing or outdated documentation."""
         items = []
 
         # Missing README
@@ -411,10 +411,66 @@ class DiscoveryEngine:
             items.append(DiscoveredWork(
                 source="missing_docs",
                 title="Create README.md",
-                description="Project has no README. Create one with setup instructions and description.",
+                description="Project has no README. Create one with: project description, setup/install instructions, usage examples, and configuration options.",
                 task_type="docs",
-                priority=30,
+                priority=40,
             ))
+        else:
+            # README exists but may be stale — check if it's very short
+            readme = (self.project_dir / "README.md").read_text(errors="replace")
+            if len(readme) < 200:
+                items.append(DiscoveredWork(
+                    source="missing_docs",
+                    title="Expand README.md — currently too short",
+                    description="README.md exists but has very little content. Add: project overview, setup instructions, usage examples, API docs, and configuration.",
+                    task_type="docs",
+                    priority=35,
+                ))
+
+        # Check for public Python files without module docstrings
+        py_files = list(self.project_dir.rglob("*.py"))
+        undocumented = []
+        for f in py_files[:50]:  # Cap scanning
+            if ".forge" in str(f) or "venv" in str(f) or "__pycache__" in str(f):
+                continue
+            try:
+                content = f.read_text(errors="replace")
+                # Check if file has classes/functions but no module docstring
+                if ("def " in content or "class " in content) and not content.strip().startswith('"""') and not content.strip().startswith("'''"):
+                    undocumented.append(str(f.relative_to(self.project_dir)))
+            except Exception:
+                pass
+
+        if len(undocumented) >= 3:
+            items.append(DiscoveredWork(
+                source="missing_docs",
+                title=f"Add docstrings to {len(undocumented)} undocumented modules",
+                description=f"These files have no module-level docstrings:\n" + "\n".join(f"- {f}" for f in undocumented[:10]),
+                task_type="docs",
+                priority=25,
+            ))
+
+        # Check for API files without inline docs
+        api_patterns = ["api", "routes", "views", "endpoints", "handlers"]
+        for f in py_files:
+            fname = f.name.lower()
+            if any(p in fname for p in api_patterns):
+                try:
+                    content = f.read_text(errors="replace")
+                    func_count = content.count("def ")
+                    doc_count = content.count('"""')
+                    if func_count > 3 and doc_count < func_count:
+                        items.append(DiscoveredWork(
+                            source="missing_docs",
+                            title=f"Document API functions in {f.name}",
+                            description=f"{f.relative_to(self.project_dir)} has {func_count} functions but only {doc_count//2} docstrings. Add docstrings with parameter descriptions and return types.",
+                            task_type="docs",
+                            priority=30,
+                            file_path=str(f.relative_to(self.project_dir)),
+                        ))
+                        break  # One docs task per cycle is enough
+                except Exception:
+                    pass
 
         return items
 

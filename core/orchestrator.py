@@ -605,11 +605,7 @@ class Orchestrator:
 
             # Parse real cost from agent log output
             cost = self._parse_cost_from_log(task)
-            cost_source = "tokens" if cost > 0 else "estimate"
-            if cost == 0:
-                # Fallback: estimate from duration
-                provider = next((p for p in self.providers if p.name == task.assigned_provider), None)
-                cost = provider.estimate_cost(duration) if provider else 0.0
+            cost_source = "tokens" if cost > 0 else "unknown"
             task.actual_cost_usd = cost
             self.budget_spent += cost
 
@@ -800,50 +796,76 @@ class Orchestrator:
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
+        cost = 0.0
 
-        # Codex format: "tokens used\n7,978"
-        token_matches = re.findall(r'tokens\s+used\s*\n\s*([\d,]+)', content)
-        if token_matches:
-            total_tokens = int(token_matches[-1].replace(",", ""))
+        # ── Claude stream-json format ──
+        # Each line is a JSON object. The "result" line has total_cost_usd (actual
+        # cost reported by the CLI). Assistant messages have usage.input_tokens etc.
+        claude_cost_found = False
+        for line in content.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
 
-        # Claude --verbose format: look for token usage in output
-        # Claude -p outputs usage stats like "input_tokens": N, "output_tokens": N
-        input_matches = re.findall(r'"input_tokens"\s*:\s*(\d+)', content)
-        output_matches = re.findall(r'"output_tokens"\s*:\s*(\d+)', content)
-        if input_matches:
-            input_tokens = sum(int(x) for x in input_matches)
-        if output_matches:
-            output_tokens = sum(int(x) for x in output_matches)
+            # Result line: {"type":"result", ..., "total_cost_usd": 0.05, ...}
+            if obj.get("type") == "result":
+                if "total_cost_usd" in obj:
+                    cost = float(obj["total_cost_usd"])
+                    claude_cost_found = True
+                elif "cost_usd" in obj:
+                    cost = float(obj["cost_usd"])
+                    claude_cost_found = True
 
-        # If we only have total (Codex), estimate split
-        if total_tokens > 0 and input_tokens == 0 and output_tokens == 0:
-            input_tokens = int(total_tokens * 0.75)
-            output_tokens = total_tokens - input_tokens
+            # Assistant messages carry per-turn usage stats
+            msg = obj.get("message", {})
+            usage = msg.get("usage") or obj.get("usage") or {}
+            if "input_tokens" in usage:
+                input_tokens += int(usage["input_tokens"])
+            if "output_tokens" in usage:
+                output_tokens += int(usage["output_tokens"])
 
-        # If we got individual counts but no total
-        if total_tokens == 0 and (input_tokens > 0 or output_tokens > 0):
-            total_tokens = input_tokens + output_tokens
+        # ── Codex format: "tokens used\n7,978" ──
+        if not claude_cost_found and input_tokens == 0 and output_tokens == 0:
+            token_matches = re.findall(r'tokens\s+used\s*\n\s*([\d,]+)', content)
+            if token_matches:
+                total_tokens = int(token_matches[-1].replace(",", ""))
+                input_tokens = int(total_tokens * 0.75)
+                output_tokens = total_tokens - input_tokens
 
-        if total_tokens == 0:
+            # Fallback: bare "input_tokens"/"output_tokens" keys (verbose text output)
+            if total_tokens == 0:
+                input_matches = re.findall(r'"input_tokens"\s*:\s*(\d+)', content)
+                output_matches = re.findall(r'"output_tokens"\s*:\s*(\d+)', content)
+                if input_matches:
+                    input_tokens = sum(int(x) for x in input_matches)
+                if output_matches:
+                    output_tokens = sum(int(x) for x in output_matches)
+
+        total_tokens = input_tokens + output_tokens if total_tokens == 0 else total_tokens
+        if total_tokens == 0 and not claude_cost_found:
             return 0.0
 
-        # Token rates per million
-        RATES = {
-            "codex-mini": {"input": 0.25, "output": 2.00},
-            "codex": {"input": 1.25, "output": 10.00},
-            "claude": {"input": 3.00, "output": 15.00},
-            "claude-haiku": {"input": 1.00, "output": 5.00},
-            "claude-opus": {"input": 5.00, "output": 25.00},
-        }
+        # If Claude gave us the real cost, use it directly; otherwise calculate
+        if not claude_cost_found:
+            RATES = {
+                "codex-mini": {"input": 0.25, "output": 2.00},
+                "codex": {"input": 1.25, "output": 10.00},
+                "claude": {"input": 3.00, "output": 15.00},
+                "claude-haiku": {"input": 1.00, "output": 5.00},
+                "claude-opus": {"input": 15.00, "output": 75.00},
+            }
+            provider = task.assigned_provider
+            rate = RATES.get(provider, {"input": 1.00, "output": 5.00})
+            cost = (input_tokens / 1_000_000) * rate["input"] + (output_tokens / 1_000_000) * rate["output"]
 
-        provider = task.assigned_provider
-        rate = RATES.get(provider, {"input": 1.00, "output": 5.00})
-
-        cost = (input_tokens / 1_000_000) * rate["input"] + (output_tokens / 1_000_000) * rate["output"]
         cost = round(cost, 6)
 
         # Write to token ledger
-        self._record_tokens(task, provider, input_tokens, output_tokens, total_tokens, cost)
+        self._record_tokens(task, task.assigned_provider, input_tokens, output_tokens, total_tokens, cost)
 
         return cost
 

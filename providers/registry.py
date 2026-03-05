@@ -296,7 +296,7 @@ class ClaudeProvider(BaseProvider):
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         full_prompt = f"{role_instructions}\n\n{prompt}" if role_instructions else prompt
-        cmd.extend(["-p", full_prompt, "--verbose"])
+        cmd.extend(["-p", full_prompt, "--output-format", "stream-json", "--verbose"])
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
         return cmd

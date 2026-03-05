@@ -510,6 +510,7 @@ class Orchestrator:
 
         # Lock
         lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
         lock_file.write_text(json.dumps({"agent": decision.provider.name, "started": task.started_at}))
 
         # Build prompt with role instructions

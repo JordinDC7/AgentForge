@@ -385,7 +385,31 @@ Live view of task board, agent logs, shared context, spending by provider, and h
 ## FAQ
 
 **How much does a typical feature cost?**
-$2-4. Architecture on Opus (~$1.50) + review on Sonnet (~$0.50) + everything else on Gemini/Codex ($0).
+10$ per 1-3 hours depending on escalations. using this setup:
+
+```budget: 195.00
+
+routing:
+  architecture: claude
+  backend: codex-mini
+  frontend: codex-mini
+  testing: codex-mini
+  review: claude
+  docs: codex-mini
+
+escalation:
+  - codex-mini
+  - claude-haiku
+  - claude
+  - claude-opus
+
+agents:
+  max_retries: 4
+  timeout_minutes: 25
+  discovery_interval: 4
+  poll_interval_seconds: 30
+  max_concurrent: 2
+```
 
 **Can I use just one provider?**
 Yes. `forge run --provider gemini --budget 0` runs everything on the free tier.

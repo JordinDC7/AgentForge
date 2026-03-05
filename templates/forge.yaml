@@ -1,0 +1,26 @@
+# AgentForge Config
+budget: 10.00
+
+# Override routing per task type (uncomment to customize):
+# routing:
+#   architecture: sonnet        # Claude Sonnet — best reasoning
+#   backend: codex-mini         # Codex — cheapest + fastest
+#   frontend: codex-mini        # Same
+#   testing: gemini             # Free
+#   review: sonnet              # Claude catches bugs
+#   docs: gemini                # Free
+
+# Available providers:
+#   gemini       — FREE (1,000 req/day, Google account)
+#   codex-mini   — $0.25/$2.00 per MTok (cheapest paid, fastest)
+#   codex        — $1.25/$10.00 per MTok (stronger, still fast)
+#   haiku        — $1/$5 per MTok (Claude budget tier)
+#   sonnet       — $3/$15 per MTok (Claude balanced)
+#   opus         — $5/$25 per MTok (Claude max intelligence)
+
+escalation:
+  - gemini
+  - codex-mini
+  - haiku
+  - sonnet
+  - opus

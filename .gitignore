@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+.DS_Store
+
+# Secrets — never commit
+.env
+*.key
+*.pem
+
+# Forge ephemeral data (per-project, not the tool itself)
+.forge/locks/
+.forge/mail/
+.forge/logs/
+.forge/memory/
+.forge/budget/
+.forge/prompts/

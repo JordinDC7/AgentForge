@@ -102,6 +102,7 @@ class BaseProvider(ABC):
         role_instructions: str = "",
         allowed_tools: Optional[list[str]] = None,
         max_budget_usd: Optional[float] = None,
+        effort: Optional[str] = None,
     ) -> list[str]:
         """Build the CLI command to spawn this agent.
 
@@ -111,6 +112,7 @@ class BaseProvider(ABC):
             role_instructions: Agent role system prompt (from agents/*.md)
             allowed_tools: Optional tool restrictions
             max_budget_usd: Per-task cost cap in USD
+            effort: Effort level hint ("low", "medium", "high")
 
         Returns:
             List of command parts (for subprocess)

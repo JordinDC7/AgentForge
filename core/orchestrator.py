@@ -400,10 +400,20 @@ class Orchestrator:
         self._save_task(task)
 
     def _inject_architecture_task(self):
-        """Always run Claude Sonnet first to assess the project and update shared context."""
+        """Run Claude Sonnet to assess the project — but skip if context is already fresh."""
         # Don't duplicate if one already exists this run
         if any(t.type == "architecture" and t.status != TaskStatus.DONE for t in self.tasks):
             return
+
+        # Skip if SHARED.md was updated recently (within last 30 min) and has real content
+        context_file = self.forge_dir / "context" / "SHARED.md"
+        if context_file.exists():
+            content = context_file.read_text()
+            age_seconds = time.time() - context_file.stat().st_mtime
+            # If context has substantial content and is less than 30 min old, skip
+            if len(content) > 500 and age_seconds < 1800:
+                self._log("  🏗️ Shared context is fresh — skipping architecture task")
+                return
 
         vision_file = self.project_dir / "VISION.md"
         claude_file = self.project_dir / "CLAUDE.md"
@@ -553,9 +563,20 @@ class Orchestrator:
         remaining_budget = self.config.budget - self.budget_spent
         task_cost_cap = min(self.config.max_cost_per_task, remaining_budget)
 
+        # Map task complexity to effort level — saves tokens on simple work
+        EFFORT_BY_TYPE = {
+            "docs": "low",
+            "testing": "medium",
+            "backend": "high",
+            "frontend": "high",
+            "architecture": "high",
+            "review": "medium",
+        }
+        effort = EFFORT_BY_TYPE.get(task.type, "medium")
+
         cmd = decision.provider.build_command(
             prompt=short_prompt, workdir=self.project_dir,
-            role_instructions="", max_budget_usd=task_cost_cap,
+            role_instructions="", max_budget_usd=task_cost_cap, effort=effort,
         )
 
         try:
@@ -793,31 +814,55 @@ class Orchestrator:
     # ════════════════════════════════════════════════════════════
 
     def _build_task_prompt(self, task: Task, role_instructions: str) -> str:
+        # ── Context: only include what this task type actually needs ──
         context_file = self.forge_dir / "context" / "SHARED.md"
-        shared = context_file.read_text() if context_file.exists() else ""
+        shared_raw = context_file.read_text() if context_file.exists() else ""
 
-        mail_dir = self.forge_dir / "mail" / task.type
+        # Architecture & review get full context; implementation tasks get a summary
+        if task.type in ("architecture", "review"):
+            shared = shared_raw[:8000]  # Cap at ~2k tokens
+        else:
+            # Extract only the sections relevant to this task type
+            shared = self._extract_relevant_context(shared_raw, task.type)
+
+        # ── Mail: only recent, relevant messages (not entire history) ──
         mail = ""
+        mail_dir = self.forge_dir / "mail" / task.type
         if mail_dir.exists():
-            for f in sorted(mail_dir.glob("*.md")):
-                mail += f.read_text() + "\n---\n"
+            recent_mail = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+            for f in recent_mail[:3]:  # Only last 3 messages, not all
+                content = f.read_text()
+                mail += content[:1000] + "\n---\n"  # Cap each message
 
-        # Include memory hints
-        memory = self.load_memory()
+        # ── Memory hints: only if actually relevant ──
         memory_hint = ""
-        failed = memory.get("failed_approaches", {})
-        relevant = {k: v for k, v in failed.items() if k.startswith(task.type + ":")}
-        if relevant:
-            memory_hint = "\n## Known Issues from Past Runs\n"
-            for k, count in relevant.items():
-                provider = k.split(":")[1]
-                memory_hint += f"- {provider} failed {count} times on {task.type} tasks\n"
+        if task.retries > 0:
+            memory = self.load_memory()
+            failed = memory.get("failed_approaches", {})
+            relevant = {k: v for k, v in failed.items() if k.startswith(task.type + ":")}
+            if relevant:
+                memory_hint = "\n## Known Issues from Past Runs\n"
+                for k, count in relevant.items():
+                    provider = k.split(":")[1]
+                    memory_hint += f"- {provider} failed {count} times on {task.type} tasks\n"
+
+        # ── Diff context for review tasks ──
+        diff_context = ""
+        if task.type == "review" and task.branch:
+            diff_context = self._get_branch_diff(task.branch)
+
+        # ── Focused file list for implementation tasks ──
+        file_hint = ""
+        if task.type in ("backend", "frontend", "testing") and task.description:
+            file_hint = self._suggest_relevant_files(task)
 
         return f"""# Task: {task.title}
 ## ID: {task.id} | Type: {task.type} | Branch: {task.branch}
 
 ## Description
 {task.description}
+{file_hint}
+{diff_context}
 
 ## Shared Context
 {shared}
@@ -827,6 +872,12 @@ class Orchestrator:
 ## Role Instructions
 {role_instructions}
 
+## Acceptance Criteria
+- All existing tests must still pass after your changes
+- New functionality must have at least one test
+- No lint errors introduced
+- Exit 0 when done, exit 1 if stuck
+
 ## Rules
 1. Work on branch: {task.branch}
 2. Run tests before committing. Fix failures.
@@ -834,6 +885,83 @@ class Orchestrator:
 4. Update .forge/context/SHARED.md with decisions.
 5. Exit 0 when done. Exit 1 if stuck.
 """
+
+    def _extract_relevant_context(self, shared: str, task_type: str) -> str:
+        """Extract only the sections of SHARED.md relevant to this task type."""
+        if not shared:
+            return ""
+
+        # Always include Architecture overview
+        sections_wanted = {"## Architecture", "## Known Issues"}
+
+        if task_type in ("backend", "testing"):
+            sections_wanted.update({"## API Contracts", "## Data Models"})
+        elif task_type == "frontend":
+            sections_wanted.update({"## Component", "## API Contracts"})
+        elif task_type == "docs":
+            sections_wanted.update({"## API Contracts", "## Implementation Plan"})
+
+        # Parse sections and keep only relevant ones
+        lines = shared.split("\n")
+        result = []
+        include = False
+        for line in lines:
+            if line.startswith("## "):
+                include = any(line.startswith(s) for s in sections_wanted)
+            if include:
+                result.append(line)
+
+        extracted = "\n".join(result)
+        return extracted[:4000] if extracted else shared[:2000]  # Fallback: truncated full context
+
+    def _get_branch_diff(self, branch: str) -> str:
+        """Get the git diff for a branch to give reviewers focused context."""
+        try:
+            # Get diff of what this branch changed vs main
+            result = subprocess.run(
+                ["git", "diff", "main..." + branch, "--stat"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=15,
+            )
+            stat = result.stdout.strip() if result.returncode == 0 else ""
+
+            result2 = subprocess.run(
+                ["git", "diff", "main..." + branch],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=15,
+            )
+            diff = result2.stdout.strip() if result2.returncode == 0 else ""
+
+            if not diff:
+                return ""
+
+            # Cap diff to avoid huge token usage
+            if len(diff) > 6000:
+                diff = diff[:6000] + "\n... (diff truncated, review the full branch)"
+
+            return f"\n## Changes to Review\n```\n{stat}\n```\n\n```diff\n{diff}\n```\n"
+        except (subprocess.TimeoutExpired, Exception):
+            return ""
+
+    def _suggest_relevant_files(self, task: Task) -> str:
+        """Suggest which files the agent should focus on based on task description."""
+        # Look for file paths mentioned in the description
+        mentioned = re.findall(r'[\w/]+\.(?:py|js|ts|jsx|tsx|json|yaml|md)', task.description)
+        if mentioned:
+            return "\n## Relevant Files\n" + "\n".join(f"- {f}" for f in mentioned[:10])
+
+        # For testing tasks, find the source files to test
+        if task.type == "testing":
+            # Extract module name from title like "Write tests for module_name"
+            match = re.search(r'tests?\s+for\s+(\w+)', task.title, re.IGNORECASE)
+            if match:
+                module = match.group(1)
+                candidates = list(self.project_dir.rglob(f"*{module}*"))
+                candidates = [f for f in candidates if ".forge" not in str(f)
+                             and "__pycache__" not in str(f) and "node_modules" not in str(f)]
+                if candidates:
+                    return "\n## Relevant Files\n" + "\n".join(
+                        f"- {f.relative_to(self.project_dir)}" for f in candidates[:5])
+
+        return ""
 
     def _load_role_instructions(self, task_type: str) -> str:
         # Check project-local agents first, then forge global

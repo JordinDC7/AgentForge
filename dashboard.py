@@ -94,6 +94,17 @@ def get_health():
     return {}
 
 
+def get_token_ledger(tail=20):
+    ledger_file = FORGE_DIR / "budget" / "token_ledger.json"
+    if ledger_file.exists():
+        try:
+            entries = json.loads(ledger_file.read_text())
+            return entries[-tail:]
+        except Exception:
+            pass
+    return []
+
+
 def get_shared_context():
     ctx_file = FORGE_DIR / "context" / "SHARED.md"
     if ctx_file.exists():
@@ -167,6 +178,7 @@ def build_api_response():
         "budget": get_budget(),
         "health": get_health(),
         "logs": get_logs(),
+        "ledger": get_token_ledger(),
         "context": get_shared_context(),
         "mail": get_mail(),
         "commits": get_git_branches(),
@@ -221,7 +233,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge-done { background: var(--green); color: white; }
   .badge-failed { background: var(--red); color: white; }
   .badge-ready { background: var(--surface2); color: var(--text2); border: 1px solid var(--border); }
-  .badge-provider { background: var(--purple); color: white; margin-left: 4px; }
+  .badge-provider { color: white; margin-left: 4px; }
   .log-viewer {
     background: #000; border-radius: 4px; padding: 10px; font-size: 11px;
     max-height: 300px; overflow-y: auto; white-space: pre-wrap;
@@ -282,8 +294,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div id="log-tabs"></div>
     <div class="log-viewer" id="log-viewer">Waiting for data...</div>
   </div>
-  <!-- Shared Context -->
+  <!-- Cost Ledger -->
+  <div class="panel" style="grid-column: span 2">
+    <div class="panel-title">Recent Cost Entries</div>
+    <div id="cost-ledger" style="max-height:200px;overflow-y:auto">—</div>
+  </div>
+  <!-- Git -->
   <div class="panel">
+    <div class="panel-title">Recent Commits</div>
+    <div class="commit-list" id="commits">—</div>
+  </div>
+  <!-- Shared Context -->
+  <div class="panel" style="grid-column: span 2">
     <div class="panel-title">Shared Context</div>
     <div class="context-box" id="context">—</div>
   </div>
@@ -292,19 +314,78 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="panel-title">Agent Mail</div>
     <div id="mail">—</div>
   </div>
-  <!-- Git -->
-  <div class="panel">
-    <div class="panel-title">Recent Commits</div>
-    <div class="commit-list" id="commits">—</div>
-  </div>
 </div>
-<div class="refresh-note">Auto-refreshes every 5 seconds</div>
+<div class="refresh-note">Auto-refreshes every 2 seconds</div>
 
 <script>
 let currentLog = 0;
 let allLogs = [];
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ── Provider color map ──
+const PROVIDER_COLORS = {
+  'claude':        { bg: '#7c3aed', border: '#a78bfa', text: '#ede9fe', label: 'Claude' },
+  'claude-haiku':  { bg: '#2563eb', border: '#60a5fa', text: '#dbeafe', label: 'Haiku' },
+  'claude-opus':   { bg: '#9333ea', border: '#c084fc', text: '#f3e8ff', label: 'Opus' },
+  'codex-mini':    { bg: '#059669', border: '#34d399', text: '#d1fae5', label: 'Codex Mini' },
+  'codex':         { bg: '#0d9488', border: '#2dd4bf', text: '#ccfbf1', label: 'Codex' },
+  'gemini':        { bg: '#d97706', border: '#fbbf24', text: '#fef3c7', label: 'Gemini' },
+  'gemini-flash':  { bg: '#ea580c', border: '#fb923c', text: '#ffedd5', label: 'Gemini Flash' },
+  'aider':         { bg: '#dc2626', border: '#f87171', text: '#fee2e2', label: 'Aider' },
+};
+const DEFAULT_PROVIDER_COLOR = { bg: '#6b7280', border: '#9ca3af', text: '#f3f4f6', label: '?' };
+
+function providerColor(name) {
+  if (!name) return DEFAULT_PROVIDER_COLOR;
+  return PROVIDER_COLORS[name.toLowerCase()] || DEFAULT_PROVIDER_COLOR;
+}
+
+function providerBadge(name) {
+  if (!name || name === '?') return '';
+  const c = providerColor(name);
+  return `<span class="badge badge-provider" style="background:${c.bg};border:1px solid ${c.border};color:${c.text}">${esc(name)}</span>`;
+}
+
+// ── Parse Claude stream-json logs into readable output ──
+function parseStreamJson(raw) {
+  const lines = raw.split('\n');
+  const out = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) { out.push(line); continue; }
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj.type === 'assistant') {
+        const parts = (obj.message?.content || []);
+        for (const p of parts) {
+          if (p.type === 'text' && p.text) out.push(p.text);
+          if (p.type === 'tool_use') out.push(`[tool] ${p.name}(${JSON.stringify(p.input || {}).slice(0, 120)})`);
+          if (p.type === 'tool_result') {
+            const txt = typeof p.content === 'string' ? p.content : JSON.stringify(p.content || '').slice(0, 200);
+            out.push(`[result] ${txt}`);
+          }
+        }
+      } else if (obj.type === 'result') {
+        const cost = obj.total_cost_usd ?? obj.cost_usd ?? '?';
+        const turns = obj.num_turns ?? '?';
+        out.push(`\n── RESULT ── cost: $${cost} · turns: ${turns} · ${obj.subtype || ''}`);
+      } else if (obj.type === 'tool_use' || obj.type === 'content_block_start') {
+        // Some stream formats emit tool_use at top level
+        if (obj.content_block?.type === 'tool_use') out.push(`[tool] ${obj.content_block.name}`);
+      } else {
+        // Pass through other types briefly
+      }
+    } catch(e) { out.push(line); }
+  }
+  return out.join('\n');
+}
+
+function fmtTokens(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return n.toString();
+}
 
 function renderStats(data) {
   const t = data.tasks;
@@ -314,24 +395,56 @@ function renderStats(data) {
   const b = data.budget;
   const spent = b.total_spent || 0;
   const budget = b.budget_total || 0;
+  const totalIn = b.total_input_tokens || 0;
+  const totalOut = b.total_output_tokens || 0;
   const totalTokens = b.total_tokens || 0;
 
-  function fmtTokens(n) {
-    if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
-    if (n >= 1000) return (n/1000).toFixed(1) + 'K';
-    return n.toString();
+  // Provider breakdown table
+  const bp = b.by_provider || {};
+  const providers = Object.entries(bp).sort((a,b) => b[1].cost - a[1].cost);
+  let providerTable = '';
+  if (providers.length > 0) {
+    const rows = providers.map(([name, info]) => {
+      const pc = providerColor(name);
+      const pct = spent > 0 ? ((info.cost / spent) * 100).toFixed(0) : 0;
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:4px 8px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${pc.bg};margin-right:6px;vertical-align:middle"></span>${esc(name)}</td>
+        <td style="padding:4px 8px;text-align:right;color:var(--text2)">${info.tasks}</td>
+        <td style="padding:4px 8px;text-align:right">${fmtTokens(info.input_tokens)}</td>
+        <td style="padding:4px 8px;text-align:right">${fmtTokens(info.output_tokens)}</td>
+        <td style="padding:4px 8px;text-align:right">${fmtTokens(info.total_tokens)}</td>
+        <td style="padding:4px 8px;text-align:right;color:var(--green);font-weight:600">$${info.cost.toFixed(4)}</td>
+        <td style="padding:4px 8px;text-align:right;color:var(--text2)">${pct}%</td>
+      </tr>`;
+    }).join('');
+
+    providerTable = `
+      <table style="width:100%;font-size:11px;border-collapse:collapse;margin-top:10px">
+        <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-weight:400">Model</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">Tasks</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">In Tok</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">Out Tok</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">Total</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">Cost</th>
+          <th style="padding:4px 8px;text-align:right;font-weight:400">%</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--border);font-weight:600">
+          <td style="padding:4px 8px">Total</td>
+          <td style="padding:4px 8px;text-align:right;color:var(--text2)">${providers.reduce((s,p)=>s+p[1].tasks,0)}</td>
+          <td style="padding:4px 8px;text-align:right">${fmtTokens(totalIn)}</td>
+          <td style="padding:4px 8px;text-align:right">${fmtTokens(totalOut)}</td>
+          <td style="padding:4px 8px;text-align:right">${fmtTokens(totalTokens)}</td>
+          <td style="padding:4px 8px;text-align:right;color:var(--green)">$${spent.toFixed(4)}</td>
+          <td style="padding:4px 8px;text-align:right;color:var(--text2)">100%</td>
+        </tr></tfoot>
+      </table>`;
   }
 
-  // Provider breakdown with tokens
-  const bp = b.by_provider || {};
-  const providerHtml = Object.entries(bp).map(([name, info]) =>
-    `<div style="font-size:10px;color:var(--text2);padding:2px 0">
-      <span style="color:var(--amber)">${name}</span>:
-      ${info.tasks}t · ${fmtTokens(info.total_tokens)} tok ·
-      <span style="color:var(--green)">$${info.cost.toFixed(4)}</span>
-      <span style="color:var(--text2);font-size:9px">(in:${fmtTokens(info.input_tokens)} out:${fmtTokens(info.output_tokens)})</span>
-    </div>`
-  ).join('');
+  // Budget progress bar
+  const budgetPct = budget > 0 ? Math.min((spent / budget) * 100, 100) : 0;
+  const budgetColor = budgetPct > 80 ? 'var(--red)' : budgetPct > 50 ? 'var(--amber)' : 'var(--green)';
 
   document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="stat-val" style="color:var(--blue)">${t.active.length}</div><div class="stat-label">Active</div></div>
@@ -345,32 +458,32 @@ function renderStats(data) {
       <div class="health-bar" style="width:120px"><div class="health-fill" style="width:${score}%;background:${scoreColor}"></div></div>
     </div>
     <div class="stat">
-      <div class="stat-val" style="color:var(--amber)">${fmtTokens(totalTokens)}</div>
-      <div class="stat-label">Tokens</div>
-    </div>
-    <div class="stat">
       <div class="stat-val" style="color:var(--green)">$${spent.toFixed(4)}</div>
-      <div class="stat-label">Est. Cost${budget ? ' / $' + budget.toFixed(0) : ''}</div>
+      <div class="stat-label">${budget ? `of $${budget.toFixed(0)} budget` : 'Cost'}</div>
+      ${budget ? `<div class="health-bar" style="width:120px;margin-top:4px"><div class="health-fill" style="width:${budgetPct}%;background:${budgetColor}"></div></div>` : ''}
+    </div>
+    <div style="width:100%;margin-top:4px">
+      ${providerTable || '<div style="font-size:10px;color:var(--text2)">No token data yet</div>'}
     </div>
   `;
-  document.getElementById('stats').innerHTML += `<div style="width:100%;margin-top:8px">${providerHtml || '<div style="font-size:10px;color:var(--text2)">No token data yet</div>'}</div>`;
 }
 
 function renderTask(t, badge) {
   const provider = t.assigned_provider || '?';
   const cost = t.actual_cost_usd || 0;
   const costStr = cost > 0 ? `$${cost.toFixed(4)}` : '';
+  const pc = providerColor(provider);
   const typeColors = {
     architecture: '#8b5cf6', review: '#f59e0b', backend: '#3b82f6',
     frontend: '#10b981', testing: '#06b6d4', docs: '#6b7280'
   };
   const typeColor = typeColors[t.type] || 'var(--text2)';
-  return `<div class="task-item">
+  return `<div class="task-item" style="border-left:3px solid ${pc.bg}">
     <span class="badge" style="background:${typeColor};color:white;margin-right:6px;min-width:32px;text-align:center">${esc(t.type ? t.type.slice(0,4) : '?')}</span>
     <span class="title">${esc(t.title || t.id)}</span>
     ${costStr ? `<span style="color:var(--amber);font-size:10px;margin:0 4px">${costStr}</span>` : ''}
     <span class="badge badge-${badge}">${badge}</span>
-    ${provider !== '?' ? `<span class="badge badge-provider">${esc(provider)}</span>` : ''}
+    ${providerBadge(provider)}
   </div>`;
 }
 
@@ -389,17 +502,48 @@ function renderTasks(data) {
 function renderLogs(data) {
   allLogs = data.logs;
   const tabs = document.getElementById('log-tabs');
-  tabs.innerHTML = allLogs.map((l, i) =>
-    `<span class="log-tab ${i === currentLog ? 'active' : ''}" onclick="currentLog=${i};refresh()">${esc(l.name.replace('.log','').slice(-20))}</span>`
-  ).join('');
+  tabs.innerHTML = allLogs.map((l, i) => {
+    // Extract provider name from log filename (taskid_provider.log)
+    const parts = l.name.replace('.log','').split('_');
+    const prov = parts.length > 1 ? parts[parts.length - 1] : '';
+    const pc = providerColor(prov);
+    const activeStyle = i === currentLog ? `color:var(--amber);background:#000;border-bottom-color:#000` : '';
+    const borderStyle = `border-top:2px solid ${pc.bg}`;
+    return `<span class="log-tab ${i === currentLog ? 'active' : ''}" style="${borderStyle};${activeStyle}" onclick="currentLog=${i};refresh()">${esc(l.name.replace('.log','').slice(-24))}</span>`;
+  }).join('');
 
   const viewer = document.getElementById('log-viewer');
   if (allLogs.length > 0 && allLogs[currentLog]) {
-    viewer.textContent = allLogs[currentLog].tail;
+    const raw = allLogs[currentLog].tail;
+    // If it looks like stream-json (starts with { lines), parse it
+    const isStreamJson = raw.split('\n').some(l => l.trim().startsWith('{"type"'));
+    viewer.textContent = isStreamJson ? parseStreamJson(raw) : raw;
     viewer.scrollTop = viewer.scrollHeight;
   } else {
     viewer.textContent = 'No logs yet...';
   }
+}
+
+function renderLedger(data) {
+  const entries = (data.ledger || []).slice().reverse();
+  if (!entries.length) {
+    document.getElementById('cost-ledger').innerHTML = '<div style="color:var(--text2);font-size:11px">No cost entries yet</div>';
+    return;
+  }
+  const rows = entries.map(e => {
+    const pc = providerColor(e.provider);
+    const ts = e.timestamp ? e.timestamp.split('T')[1]?.slice(0,8) || '' : '';
+    return `<div style="display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center">
+      <span style="color:var(--text2);width:56px;flex-shrink:0">${ts}</span>
+      <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${pc.bg};flex-shrink:0"></span>
+      <span style="width:80px;flex-shrink:0;color:${pc.border}">${esc(e.provider || '?')}</span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">${esc(e.task_title || e.task_id || '')}</span>
+      <span style="width:60px;text-align:right;flex-shrink:0" title="Input tokens">${fmtTokens(e.input_tokens||0)} in</span>
+      <span style="width:60px;text-align:right;flex-shrink:0" title="Output tokens">${fmtTokens(e.output_tokens||0)} out</span>
+      <span style="width:70px;text-align:right;flex-shrink:0;color:var(--green);font-weight:600">$${(e.cost_usd||0).toFixed(4)}</span>
+    </div>`;
+  }).join('');
+  document.getElementById('cost-ledger').innerHTML = rows;
 }
 
 function renderContext(data) {
@@ -432,6 +576,7 @@ async function refresh() {
     renderStats(data);
     renderTasks(data);
     renderLogs(data);
+    renderLedger(data);
     renderContext(data);
     renderMail(data);
     renderCommits(data);
@@ -441,7 +586,7 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 2000);
 </script>
 </body>
 </html>

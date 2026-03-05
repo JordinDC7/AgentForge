@@ -92,6 +92,7 @@ class RunConfig:
     discovery_interval: int = 3              # Run discovery every N completed tasks
     max_iterations: int = 500                # Safety cap for continuous mode
     max_concurrent: int = 2                  # Max agents running at same time (rate limit safety)
+    max_cost_per_task: float = 5.0           # Max USD per individual task (safety cap)
     goal: str = ""                           # High-level goal description
 
 
@@ -153,6 +154,8 @@ class Orchestrator:
             self.config.discovery_interval = agents_cfg["discovery_interval"]
         if "max_concurrent" in agents_cfg:
             self.config.max_concurrent = agents_cfg["max_concurrent"]
+        if "max_cost_per_task" in data:
+            self.config.max_cost_per_task = float(data["max_cost_per_task"])
 
     def _handle_shutdown(self, signum, frame):
         """Graceful shutdown on Ctrl+C."""
@@ -477,8 +480,22 @@ class Orchestrator:
     def _dispatch_task(self, task: Task):
         self._log(f"\n🚀 Dispatching: {task.id} ({task.type}) — {task.title[:50]}")
 
+        # Check lock — prevent double-dispatch
+        lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
+        if lock_file.exists():
+            try:
+                lock_data = json.loads(lock_file.read_text())
+                self._log(f"  ⚠ Skipping — already locked by {lock_data.get('agent', '?')}")
+                return
+            except Exception:
+                pass  # Stale/corrupt lock, proceed
+
         # Resolve provider (with overrides)
         preferred = self._resolve_provider(task)
+
+        # Load failure history for adaptive routing
+        memory = self.load_memory()
+        failure_history = memory.get("failed_approaches", {})
 
         try:
             decision = self.router.route(
@@ -486,6 +503,7 @@ class Orchestrator:
                 complexity_override=task.complexity,
                 estimated_duration_minutes=task.estimated_minutes,
                 preferred_provider=preferred,
+                failure_history=failure_history,
             )
         except RuntimeError as e:
             self._log(f"  ❌ No provider: {e}")
@@ -531,7 +549,14 @@ class Orchestrator:
             f"When done, commit your changes and exit."
         )
 
-        cmd = decision.provider.build_command(prompt=short_prompt, workdir=self.project_dir, role_instructions="")
+        # Calculate per-task cost cap: min of configured cap and remaining budget
+        remaining_budget = self.config.budget - self.budget_spent
+        task_cost_cap = min(self.config.max_cost_per_task, remaining_budget)
+
+        cmd = decision.provider.build_command(
+            prompt=short_prompt, workdir=self.project_dir,
+            role_instructions="", max_budget_usd=task_cost_cap,
+        )
 
         try:
             log_file = self.forge_dir / "logs" / f"{task.id}_{decision.provider.name}.log"
@@ -582,6 +607,20 @@ class Orchestrator:
         for task_id, proc in self._active_processes.items():
             ret = proc.poll()
             if ret is None:
+                # Check timeout — kill runaway agents
+                task = next((t for t in self.tasks if t.id == task_id), None)
+                if task and task.started_at:
+                    start = datetime.fromisoformat(task.started_at)
+                    elapsed = (datetime.now() - start).total_seconds()
+                    provider = next((p for p in self.providers if p.name == task.assigned_provider), None)
+                    timeout_secs = (provider.config.timeout_minutes if provider else 30) * 60
+                    if elapsed > timeout_secs:
+                        self._log(f"  ⏰ {task_id} TIMED OUT after {elapsed/60:.0f}min (limit: {timeout_secs/60:.0f}min) — killing")
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        # Don't continue — let the next poll() pick up the exit code
                 continue
 
             # Close the log file handle so all data is written to disk
@@ -615,6 +654,10 @@ class Orchestrator:
                 self._tasks_completed_since_discovery += 1
                 self._log(f"  ✅ {task_id} DONE (${cost:.4f} [{cost_source}], {duration:.0f}s, {task.assigned_provider})")
                 self._save_to_memory(task, success=True)
+
+                # Auto-merge the agent's branch back to main
+                if task.branch:
+                    self._try_auto_merge(task)
 
                 # Auto-create review task for completed work (except reviews themselves)
                 if task.type not in ("review", "docs", "architecture") and task.source != "review":
@@ -659,6 +702,42 @@ class Orchestrator:
 
         for tid in completed:
             self._active_processes.pop(tid, None)
+
+    def _try_auto_merge(self, task: Task):
+        """Try to merge the agent's branch back to main. Skip on conflict."""
+        branch = task.branch
+        try:
+            # Check if branch exists and has commits ahead of main
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", branch],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return  # Branch doesn't exist (agent may not have created it)
+
+            # Get current branch to restore later
+            current = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+
+            # Attempt merge with --no-edit (no interactive editor)
+            merge = subprocess.run(
+                ["git", "merge", branch, "--no-ff", "-m", f"forge: merge {task.id} ({task.type})"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=30,
+            )
+
+            if merge.returncode == 0:
+                self._log(f"  🔀 Auto-merged {branch} → {current}")
+            else:
+                # Conflict — abort and leave branch for manual merge
+                subprocess.run(
+                    ["git", "merge", "--abort"],
+                    cwd=self.project_dir, capture_output=True, timeout=10,
+                )
+                self._log(f"  ⚠ Merge conflict on {branch} — left for manual merge")
+        except (subprocess.TimeoutExpired, Exception) as e:
+            self._log(f"  ⚠ Auto-merge skipped: {e}")
 
     # ════════════════════════════════════════════════════════════
     # MEMORY (persists across sessions)
@@ -870,29 +949,48 @@ class Orchestrator:
         return cost
 
     def _record_tokens(self, task, provider, input_tokens, output_tokens, total_tokens, cost):
-        """Append to the token ledger — single source of truth for all spending."""
+        """Append to the token ledger — single source of truth for all spending.
+
+        Uses a .lock file to prevent concurrent writes from corrupting the ledger.
+        """
         ledger_file = self.forge_dir / "budget" / "token_ledger.json"
         ledger_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        ledger = []
-        if ledger_file.exists():
+        lock = ledger_file.with_suffix(".lock")
+
+        # Simple spinlock — wait up to 5s for other writers
+        for _ in range(50):
             try:
-                ledger = json.loads(ledger_file.read_text())
-            except Exception:
-                ledger = []
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                time.sleep(0.1)
+        else:
+            # Lock held too long — remove stale lock and proceed
+            lock.unlink(missing_ok=True)
 
-        ledger.append({
-            "task_id": task.id,
-            "task_title": task.title[:60],
-            "provider": provider,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "cost_usd": cost,
-            "timestamp": datetime.now().isoformat(),
-        })
+        try:
+            ledger = []
+            if ledger_file.exists():
+                try:
+                    ledger = json.loads(ledger_file.read_text())
+                except Exception:
+                    ledger = []
 
-        ledger_file.write_text(json.dumps(ledger[-500:], indent=2))
+            ledger.append({
+                "task_id": task.id,
+                "task_title": task.title[:60],
+                "provider": provider,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "cost_usd": cost,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            ledger_file.write_text(json.dumps(ledger[-500:], indent=2))
+        finally:
+            lock.unlink(missing_ok=True)
 
     def _sync_budget(self):
         """Build spending summary from token ledger."""

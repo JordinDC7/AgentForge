@@ -75,14 +75,16 @@ class CostRouter:
         complexity_override: Optional[TaskComplexity] = None,
         preferred_provider: Optional[str] = None,
         estimated_duration_minutes: float = 30.0,
+        failure_history: Optional[dict[str, int]] = None,
     ) -> RouteDecision:
         """Route a task to the best provider.
-        
+
         Args:
             task_type: One of the keys in TASK_TYPE_REQUIREMENTS
             complexity_override: Force a specific complexity level
             preferred_provider: User override — use this provider if available
             estimated_duration_minutes: How long we expect this to take
+            failure_history: Dict of "task_type:provider" → failure count from memory
         """
         # Get requirements for this task type
         if task_type in TASK_TYPE_REQUIREMENTS:
@@ -93,6 +95,15 @@ class CostRouter:
 
         complexity = complexity_override or default_complexity
         min_accuracy = COMPLEXITY_MIN_ACCURACY[complexity]
+
+        # Build set of providers to avoid based on failure history
+        # If a provider has failed 2+ times on this task type, skip it
+        failed_providers = set()
+        if failure_history:
+            for key, count in failure_history.items():
+                parts = key.split(":", 1)
+                if len(parts) == 2 and parts[0] == task_type and count >= 2:
+                    failed_providers.add(parts[1])
 
         # User override — just use what they asked for
         if preferred_provider:
@@ -126,6 +137,14 @@ class CostRouter:
         tier_order = {CostTier.FREE: 0, CostTier.SUBSCRIPTION: 1, CostTier.LOW: 2, CostTier.MEDIUM: 3, CostTier.HIGH: 4}
         candidates.sort(key=lambda p: (tier_order.get(p.config.cost_tier, 99), p.config.cost_per_hour_usd))
 
+        # Deprioritize providers that have failed repeatedly on this task type
+        # Move them to the end rather than removing (they're still a last resort)
+        if failed_providers:
+            good = [p for p in candidates if p.name not in failed_providers]
+            bad = [p for p in candidates if p.name in failed_providers]
+            if good:
+                candidates = good + bad
+
         # Pick cheapest
         chosen = candidates[0]
         cost = chosen.estimate_cost(estimated_duration_minutes * 60)
@@ -151,6 +170,8 @@ class CostRouter:
             f"cost=~${cost:.2f}, "
             f"complexity={complexity.value}"
         )
+        if chosen.name in failed_providers:
+            reason += " (WARNING: this provider has failed before on this task type)"
 
         return RouteDecision(
             provider=chosen,

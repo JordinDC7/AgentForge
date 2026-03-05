@@ -226,7 +226,7 @@ class GeminiProvider(BaseProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None) -> list[str]:
+    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None) -> list[str]:
         cmd = ["gemini"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -259,7 +259,7 @@ class CodexProvider(BaseProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None) -> list[str]:
+    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None) -> list[str]:
         cmd = ["codex", "--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -291,12 +291,14 @@ class ClaudeProvider(BaseProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None) -> list[str]:
+    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None) -> list[str]:
         cmd = ["claude", "--dangerously-skip-permissions"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         full_prompt = f"{role_instructions}\n\n{prompt}" if role_instructions else prompt
         cmd.extend(["-p", full_prompt, "--output-format", "stream-json", "--verbose"])
+        if max_budget_usd is not None:
+            cmd.extend(["--max-budget-usd", str(max_budget_usd)])
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
         return cmd
@@ -325,7 +327,7 @@ class AiderProvider(BaseProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None) -> list[str]:
+    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None) -> list[str]:
         cmd = ["aider", "--yes-always", "--no-auto-commits"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -357,7 +359,7 @@ class OpenCodeProvider(BaseProvider):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None) -> list[str]:
+    def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None) -> list[str]:
         cmd = ["opencode"]
         full_prompt = f"{role_instructions}\n\n{prompt}" if role_instructions else prompt
         cmd.extend(["--message", full_prompt])

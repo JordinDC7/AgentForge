@@ -101,15 +101,17 @@ class BaseProvider(ABC):
         workdir: Path,
         role_instructions: str = "",
         allowed_tools: Optional[list[str]] = None,
+        max_budget_usd: Optional[float] = None,
     ) -> list[str]:
         """Build the CLI command to spawn this agent.
-        
+
         Args:
             prompt: The task description / instructions
             workdir: Working directory for the agent
             role_instructions: Agent role system prompt (from agents/*.md)
             allowed_tools: Optional tool restrictions
-            
+            max_budget_usd: Per-task cost cap in USD
+
         Returns:
             List of command parts (for subprocess)
         """

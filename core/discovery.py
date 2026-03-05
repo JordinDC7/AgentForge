@@ -470,63 +470,182 @@ class DiscoveryEngine:
         return titles
 
     def get_project_health(self) -> dict:
-        """Calculate a project health score for ship-readiness."""
-        score = 100  # Start at 100, deduct for issues
-        details = {}
+        """Calculate a project health score for ship-readiness.
 
-        # Test coverage proxy: ratio of test files to source files
-        src_count = len([f for f in self.project_dir.rglob("*.py")
-                         if "test" not in f.name.lower() and "__pycache__" not in str(f)
-                         and ".forge" not in str(f) and "venv" not in str(f)
-                         and f.name != "__init__.py"])
-        test_count = len([f for f in self.project_dir.rglob("test_*.py")
-                          if "__pycache__" not in str(f)])
+        Scoring breakdown (100 total):
+          Tests (30 pts): file coverage ratio + whether tests actually pass
+          Code quality (25 pts): TODOs by severity + lint errors
+          Security (20 pts): hardcoded secrets, missing .env.example
+          Documentation (10 pts): README, inline docs
+          Task completion (15 pts): ratio of done vs total forge tasks
+        """
+        breakdown = {}
+        score = 0
+
+        # ── Tests (30 pts) ──
+        src_files = [f for f in self.project_dir.rglob("*.py")
+                     if "test" not in f.name.lower() and "__pycache__" not in str(f)
+                     and ".forge" not in str(f) and "venv" not in str(f)
+                     and "node_modules" not in str(f) and f.name != "__init__.py"]
+        test_files = [f for f in self.project_dir.rglob("test_*.py")
+                      if "__pycache__" not in str(f)]
+        # Also count JS/TS test files
+        for pattern in ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts",
+                        "*.test.jsx", "*.test.tsx", "*.spec.jsx", "*.spec.tsx"]:
+            test_files.extend(self.project_dir.rglob(pattern))
+        for pattern in ["*.js", "*.ts", "*.jsx", "*.tsx"]:
+            src_files.extend(f for f in self.project_dir.rglob(pattern)
+                           if "test" not in f.name.lower() and "spec" not in f.name.lower()
+                           and "node_modules" not in str(f) and ".forge" not in str(f))
+
+        src_count = len(src_files)
+        test_count = len(test_files)
         test_ratio = test_count / max(src_count, 1)
-        details["test_coverage_proxy"] = f"{test_ratio:.0%}"
-        if test_ratio < 0.5:
-            score -= 20
-        elif test_ratio < 0.8:
-            score -= 10
+        breakdown["test_file_ratio"] = f"{test_ratio:.0%}"
 
-        # TODO count
+        # File coverage: 0-20 pts
+        if test_ratio >= 0.8:
+            test_pts = 20
+        elif test_ratio >= 0.5:
+            test_pts = 15
+        elif test_ratio >= 0.3:
+            test_pts = 10
+        elif test_ratio > 0:
+            test_pts = 5
+        else:
+            test_pts = 0
+
+        # Test pass rate: 0-10 pts (check if tests actually run and pass)
+        test_pass_pts = 0
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", "--tb=no", "-q", "--no-header"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=60,
+            )
+            output = result.stdout + result.stderr
+            # Parse "X passed, Y failed" or "X passed"
+            passed_match = re.search(r'(\d+)\s+passed', output)
+            failed_match = re.search(r'(\d+)\s+failed', output)
+            passed = int(passed_match.group(1)) if passed_match else 0
+            failed = int(failed_match.group(1)) if failed_match else 0
+            total_tests = passed + failed
+            breakdown["tests_passed"] = passed
+            breakdown["tests_failed"] = failed
+            if total_tests > 0:
+                pass_rate = passed / total_tests
+                test_pass_pts = round(pass_rate * 10)
+            elif result.returncode == 0:
+                test_pass_pts = 5  # Tests exist and didn't crash
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            breakdown["tests_passed"] = "?"
+            breakdown["tests_failed"] = "?"
+            test_pass_pts = 0
+
+        test_total = test_pts + test_pass_pts
+        breakdown["test_score"] = f"{test_total}/30"
+        score += test_total
+
+        # ── Code quality (25 pts) ──
+        # TODOs: weighted by severity
         todos = self._scan_todos()
-        details["todo_count"] = len(todos)
-        score -= min(len(todos) * 2, 20)
+        fixme_count = sum(1 for t in todos if "FIXME" in t.title or "BUG" in t.title)
+        hack_count = sum(1 for t in todos if "HACK" in t.title or "XXX" in t.title)
+        todo_count = len(todos) - fixme_count - hack_count
+        breakdown["todos"] = todo_count
+        breakdown["fixmes"] = fixme_count
+        breakdown["hacks"] = hack_count
+        # FIXME/BUG: -3 pts each, HACK/XXX: -2 pts each, TODO: -1 pt each
+        todo_penalty = min(fixme_count * 3 + hack_count * 2 + todo_count * 1, 15)
 
-        # Lint errors
+        # Lint: deduct based on file count with errors, not raw error count
         lint = self._scan_lint_errors()
-        details["lint_issues"] = len(lint)
-        score -= min(len(lint) * 3, 15)
+        lint_penalty = min(len(lint) * 2, 10)
+        breakdown["lint_files_with_errors"] = len(lint)
 
-        # Security
+        quality_score = max(0, 25 - todo_penalty - lint_penalty)
+        breakdown["quality_score"] = f"{quality_score}/25"
+        score += quality_score
+
+        # ── Security (20 pts) ──
         security = self._scan_security_issues()
-        details["security_issues"] = len(security)
-        score -= len(security) * 10
+        sec_penalty = len(security) * 10  # Each secret is a critical issue
+        breakdown["security_issues"] = len(security)
 
-        # Has README
-        has_readme = (self.project_dir / "README.md").exists()
-        details["has_readme"] = has_readme
-        if not has_readme:
-            score -= 5
-
-        # Has .env.example (if .env exists)
+        env_penalty = 0
         if (self.project_dir / ".env").exists():
             has_example = (self.project_dir / ".env.example").exists()
-            details["has_env_example"] = has_example
+            breakdown["has_env_example"] = has_example
             if not has_example:
-                score -= 5
+                env_penalty = 5
 
-        score = max(0, min(100, score))
-        details["score"] = score
+        security_score = max(0, 20 - sec_penalty - env_penalty)
+        breakdown["security_score"] = f"{security_score}/20"
+        score += security_score
 
-        # Ship readiness label
-        if score >= 80:
-            details["readiness"] = "🟢 Ready to ship"
-        elif score >= 60:
-            details["readiness"] = "🟡 Almost there"
-        elif score >= 40:
-            details["readiness"] = "🟠 Needs work"
+        # ── Documentation (10 pts) ──
+        doc_score = 0
+        has_readme = (self.project_dir / "README.md").exists()
+        breakdown["has_readme"] = has_readme
+        if has_readme:
+            doc_score += 5
+            # Bonus: README has meaningful content (>500 chars)
+            try:
+                readme_len = len((self.project_dir / "README.md").read_text())
+                if readme_len > 500:
+                    doc_score += 3
+            except Exception:
+                pass
+
+        # Has CLAUDE.md or similar project config
+        has_project_docs = any((self.project_dir / f).exists()
+                              for f in ["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"])
+        if has_project_docs:
+            doc_score += 2
+        breakdown["doc_score"] = f"{min(doc_score, 10)}/10"
+        score += min(doc_score, 10)
+
+        # ── Task completion (15 pts) ──
+        tasks_dir = self.forge_dir / "tasks"
+        task_total = 0
+        task_done = 0
+        task_failed = 0
+        if tasks_dir.exists():
+            for f in tasks_dir.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                    task_total += 1
+                    if data.get("status") == "done":
+                        task_done += 1
+                    elif data.get("status") == "failed":
+                        task_failed += 1
+                except Exception:
+                    pass
+
+        if task_total > 0:
+            completion_rate = task_done / task_total
+            task_pts = round(completion_rate * 15)
+            # Penalize failures
+            if task_failed > 0:
+                task_pts = max(0, task_pts - min(task_failed * 2, 5))
         else:
-            details["readiness"] = "🔴 Not ready"
+            task_pts = 8  # No tasks = neutral (not penalized for not using forge)
+        breakdown["tasks_done"] = task_done
+        breakdown["tasks_total"] = task_total
+        breakdown["tasks_failed"] = task_failed
+        breakdown["task_score"] = f"{task_pts}/15"
+        score += task_pts
 
-        return details
+        # ── Final score ──
+        score = max(0, min(100, score))
+        breakdown["score"] = score
+
+        if score >= 80:
+            breakdown["readiness"] = "🟢 Ready to ship"
+        elif score >= 60:
+            breakdown["readiness"] = "🟡 Almost there"
+        elif score >= 40:
+            breakdown["readiness"] = "🟠 Needs work"
+        else:
+            breakdown["readiness"] = "🔴 Not ready"
+
+        return breakdown

@@ -431,7 +431,11 @@ class Orchestrator:
             title="Assess project and update shared context",
             description=(
                 f"You are the lead architect. {vision_exists} {claude_exists} scan the entire codebase.\n\n"
-                "Update .forge/context/SHARED.md with:\n"
+                "IMPORTANT: Read the existing .forge/context/SHARED.md first. "
+                "MERGE your findings into it — preserve all existing sections and content. "
+                "Add new information, update what has changed, and remove only what is clearly obsolete. "
+                "Do NOT overwrite or replace the file from scratch.\n\n"
+                "Ensure these sections exist and are up to date:\n"
                 "## Architecture\n"
                 "- List every module and what it does\n"
                 "- Document the data flow between components\n\n"

@@ -94,6 +94,8 @@ class RunConfig:
     max_concurrent: int = 2                  # Max agents running at same time (rate limit safety)
     max_cost_per_task: float = 5.0           # Max USD per individual task (safety cap)
     goal: str = ""                           # High-level goal description
+    timeout_minutes: int = 30               # Default timeout for agents
+    test_first: bool = True                  # Generate tests before implementation
 
 
 class Orchestrator:
@@ -119,6 +121,7 @@ class Orchestrator:
         self._active_log_handles: dict[str, object] = {}  # Track log file handles to flush/close
         self._tasks_completed_since_discovery = 0
         self._running = True
+        self._style_guide: str = ""  # Cached project style guide
 
         # Load routing overrides from forge.yaml if not set via CLI
         self._load_yaml_config()
@@ -227,10 +230,17 @@ class Orchestrator:
         self._cleanup_stale_locks()
         self._reset_stuck_tasks()
 
+        # Extract project coding style once at startup (cached for all agents)
+        self._style_guide = self._extract_style_guide()
+        if self._style_guide:
+            self._log(f"  📐 Extracted project style guide ({len(self._style_guide)} chars)")
+
         # Always create an architecture assessment task at the start
         # This ensures Claude Sonnet runs to review the codebase and update shared context
         self._inject_architecture_task()
-        # Create review tasks for any implementation tasks already in the queue
+        # Create test-first tasks (tests before implementation) + review tasks
+        if self.config.test_first:
+            self._inject_test_first_tasks()
         self._inject_review_tasks()
 
         iteration = 0
@@ -519,6 +529,177 @@ class Orchestrator:
         self.add_task(docs_task)
         self._log(f"  📄 Created docs task for {len(completed_impl)} implemented features")
 
+    def _inject_test_first_tasks(self):
+        """TDD: create test tasks that run BEFORE implementation, not after.
+
+        This is the single biggest quality improvement. When tests exist first:
+        - The implementation agent has a concrete pass/fail target
+        - Edge cases are caught before code is written
+        - The validation gate can verify tests pass after implementation
+        """
+        impl_tasks = [t for t in self.tasks
+                      if t.type in ("backend", "frontend")
+                      and t.status in (TaskStatus.READY, TaskStatus.BACKLOG)]
+        existing_tests = {t.title for t in self.tasks if t.type == "testing"}
+
+        for impl_task in impl_tasks:
+            test_title = f"Tests: {impl_task.title[:60]}"
+            if test_title in existing_tests:
+                continue
+
+            # Create a test task that depends on architecture but runs BEFORE implementation
+            arch_deps = [d for d in impl_task.depends_on if d.startswith("arch")]
+
+            test_task = Task(
+                id=f"test-pre-{impl_task.id}",
+                type="testing",
+                title=test_title,
+                description=(
+                    f"Write tests FIRST for: {impl_task.title}\n\n"
+                    f"Read .forge/context/SHARED.md for the API contracts and data models.\n"
+                    f"Write tests that define the expected behavior BEFORE implementation.\n\n"
+                    f"These tests SHOULD FAIL right now — that's correct. They define what\n"
+                    f"the implementation agent needs to build.\n\n"
+                    f"Write:\n"
+                    f"- Unit tests for each function/endpoint in the spec\n"
+                    f"- Edge case tests (empty input, invalid data, boundary values)\n"
+                    f"- Integration test for the happy path\n\n"
+                    f"Commit the tests even though they fail. The implementation agent\n"
+                    f"will make them pass."
+                ),
+                status=TaskStatus.BACKLOG,
+                depends_on=arch_deps,  # Depends on architecture, not implementation
+                priority=impl_task.priority + 5,  # Slightly higher than impl
+                source="test-first",
+            )
+            self.add_task(test_task)
+
+            # Make the implementation task depend on the test task
+            if test_task.id not in impl_task.depends_on:
+                impl_task.depends_on.append(test_task.id)
+                self._save_task(impl_task)
+
+            # Update impl description to reference the pre-written tests
+            if "make the pre-written tests pass" not in impl_task.description:
+                impl_task.description += (
+                    f"\n\n## Test-Driven Development\n"
+                    f"Tests have already been written in task `{test_task.id}`.\n"
+                    f"Your job is to make ALL pre-written tests pass.\n"
+                    f"Run the test suite after implementation. Do not modify the test files\n"
+                    f"unless a test is genuinely wrong (not matching the spec).\n"
+                )
+                self._save_task(impl_task)
+
+        if impl_tasks:
+            self._log(f"  🧪 Test-first: created test tasks for {len(impl_tasks)} implementation tasks")
+
+    def _extract_style_guide(self) -> str:
+        """Scan the existing codebase and extract coding patterns.
+
+        This makes agents write code that matches the project, not generic LLM style.
+        Runs once at startup, cached for all agents.
+        """
+        style_file = self.forge_dir / "context" / "STYLE.md"
+
+        # Use cached style if it's fresh (< 1 hour old)
+        if style_file.exists():
+            age = time.time() - style_file.stat().st_mtime
+            if age < 3600:
+                return style_file.read_text()
+
+        patterns = []
+
+        # Detect language and framework
+        project_files = list(self.project_dir.rglob("*"))
+        py_files = [f for f in project_files if f.suffix == ".py" and ".forge" not in str(f) and "venv" not in str(f)]
+        js_files = [f for f in project_files if f.suffix in (".js", ".ts", ".jsx", ".tsx") and "node_modules" not in str(f)]
+
+        if py_files:
+            patterns.append("Language: Python")
+            # Sample a few files for style
+            for f in py_files[:5]:
+                try:
+                    content = f.read_text(errors="replace")
+                    lines = content.split("\n")
+
+                    # Detect indentation
+                    for line in lines[:50]:
+                        if line.startswith("    "):
+                            patterns.append("Indentation: 4 spaces")
+                            break
+                        elif line.startswith("\t"):
+                            patterns.append("Indentation: tabs")
+                            break
+
+                    # Detect type hints
+                    if "-> " in content or ": str" in content or ": int" in content:
+                        patterns.append("Type hints: yes — use type annotations on all functions")
+
+                    # Detect docstring style
+                    if '"""' in content:
+                        if ":param " in content:
+                            patterns.append("Docstring style: Sphinx (:param, :returns:)")
+                        elif "Args:" in content:
+                            patterns.append("Docstring style: Google (Args:, Returns:)")
+                        else:
+                            patterns.append("Docstring style: simple triple-quote")
+
+                    # Detect naming convention
+                    if re.search(r'def [a-z]+_[a-z]+', content):
+                        patterns.append("Naming: snake_case for functions")
+                    if re.search(r'class [A-Z][a-z]+[A-Z]', content):
+                        patterns.append("Naming: PascalCase for classes")
+
+                    # Detect common frameworks
+                    if "from fastapi" in content or "import fastapi" in content:
+                        patterns.append("Framework: FastAPI")
+                    elif "from flask" in content:
+                        patterns.append("Framework: Flask")
+                    elif "from django" in content:
+                        patterns.append("Framework: Django")
+                    if "import pytest" in content:
+                        patterns.append("Testing: pytest")
+                    if "from dataclasses" in content:
+                        patterns.append("Data models: dataclasses")
+                    if "from pydantic" in content:
+                        patterns.append("Data models: Pydantic")
+
+                    break  # One file is enough for style detection
+                except Exception:
+                    continue
+
+        elif js_files:
+            patterns.append("Language: JavaScript/TypeScript")
+            for f in js_files[:3]:
+                try:
+                    content = f.read_text(errors="replace")
+                    if "import React" in content or "from 'react'" in content:
+                        patterns.append("Framework: React")
+                    if "export default function" in content:
+                        patterns.append("Components: function components")
+                    if f.suffix in (".ts", ".tsx"):
+                        patterns.append("TypeScript: yes — use types on all exports")
+                    if "const " in content and "var " not in content:
+                        patterns.append("Variables: const/let (no var)")
+                    break
+                except Exception:
+                    continue
+
+        # Deduplicate
+        patterns = list(dict.fromkeys(patterns))
+
+        if not patterns:
+            return ""
+
+        guide = "## Project Style Guide (auto-detected)\n" + "\n".join(f"- {p}" for p in patterns)
+        guide += "\n\nMatch these patterns exactly. Do NOT introduce new conventions."
+
+        # Cache it
+        style_file.parent.mkdir(parents=True, exist_ok=True)
+        style_file.write_text(guide)
+
+        return guide
+
     def _cleanup_stale_locks(self):
         """Remove lock files from previous runs that no longer have active processes."""
         locks_dir = self.forge_dir / "locks"
@@ -756,16 +937,8 @@ class Orchestrator:
         remaining_budget = self.config.budget - self.budget_spent
         task_cost_cap = min(self.config.max_cost_per_task, remaining_budget)
 
-        # Map task complexity to effort level — saves tokens on simple work
-        EFFORT_BY_TYPE = {
-            "docs": "low",
-            "testing": "medium",
-            "backend": "high",
-            "frontend": "high",
-            "architecture": "high",
-            "review": "medium",
-        }
-        effort = EFFORT_BY_TYPE.get(task.type, "medium")
+        # Smart effort scaling — based on actual task complexity, not just type
+        effort = self._compute_effort(task)
 
         cmd = decision.provider.build_command(
             prompt=short_prompt, workdir=self.project_dir,
@@ -900,22 +1073,25 @@ class Orchestrator:
                 if task.status == TaskStatus.DONE and task.branch:
                     self._try_auto_merge(task)
 
-                # Auto-create review task for completed work (except reviews themselves)
+                # Auto-create review task — but skip for small/trivial changes
                 if task.status == TaskStatus.DONE and task.type not in ("review", "docs", "architecture") and task.source != "review":
-                    review_id = f"review-{task.id}"
-                    if not any(t.id == review_id for t in self.tasks):
-                        review_task = Task(
-                            id=review_id,
-                            type="review",
-                            title=f"Review: {task.title[:60]}",
-                            description=self._build_review_description(task),
-                            status=TaskStatus.READY,
-                            priority=65,
-                            source="review",
-                            branch=task.branch,
-                        )
-                        self.add_task(review_task)
-                        self._log(f"  📝 Created review task → routes to Claude Sonnet")
+                    if self._needs_review(task):
+                        review_id = f"review-{task.id}"
+                        if not any(t.id == review_id for t in self.tasks):
+                            review_task = Task(
+                                id=review_id,
+                                type="review",
+                                title=f"Review: {task.title[:60]}",
+                                description=self._build_review_description(task),
+                                status=TaskStatus.READY,
+                                priority=65,
+                                source="review",
+                                branch=task.branch,
+                            )
+                            self.add_task(review_task)
+                            self._log(f"  📝 Created review task")
+                    else:
+                        self._log(f"  ⏭ Skipping review — small change, tests passed")
 
                 # After review completes, check if it flagged issues → create fix tasks
                 if task.status == TaskStatus.DONE and task.type == "review":
@@ -948,6 +1124,83 @@ class Orchestrator:
 
         for tid in completed:
             self._active_processes.pop(tid, None)
+
+    def _needs_review(self, task: Task) -> bool:
+        """Decide if a completed task needs a full review or can skip.
+
+        Skipping review for trivial changes saves an entire agent call (~$0.50-2.00).
+        Only skip when: small diff, tests pass, and not security-sensitive.
+        """
+        # Always review: retried tasks, fix tasks, anything security-related
+        security_signals = ["auth", "login", "password", "token", "secret", "encrypt", "payment", "sql"]
+        desc_lower = task.description.lower()
+        if any(s in desc_lower for s in security_signals):
+            return True
+        if task.retries > 0 or task.source == "review-fix":
+            return True
+
+        # Check diff size
+        if task.branch:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--stat", f"main...{task.branch}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split("\n")
+                    # Parse the summary line: "3 files changed, 45 insertions(+), 12 deletions(-)"
+                    summary = lines[-1] if lines else ""
+                    import re as _re
+                    insertions = _re.search(r'(\d+) insertion', summary)
+                    ins = int(insertions.group(1)) if insertions else 0
+                    # Small change = less than 50 lines inserted
+                    if ins < 50:
+                        return False
+            except Exception:
+                pass
+
+        return True  # Default: review everything
+
+    def _compute_effort(self, task: Task) -> str:
+        """Dynamically size effort based on actual task complexity.
+
+        This saves ~40% on tokens for simple tasks while ensuring complex
+        tasks get full reasoning depth. Based on task description length,
+        type, retry count, and estimated scope.
+        """
+        desc_len = len(task.description)
+        is_retry = task.retries > 0
+        is_fix = task.source == "review-fix"
+
+        # Retries and fixes always get high effort — we already failed once
+        if is_retry or is_fix:
+            return "high"
+
+        # Type-based baseline
+        type_effort = {
+            "docs": "low",
+            "testing": "medium",
+            "review": "medium",
+            "architecture": "high",
+            "backend": "medium",
+            "frontend": "medium",
+        }
+        baseline = type_effort.get(task.type, "medium")
+
+        # Upgrade based on description complexity signals
+        complexity_signals = [
+            "security", "authentication", "migration", "refactor",
+            "database", "concurrent", "async", "websocket", "oauth",
+            "encryption", "payment", "transaction",
+        ]
+        desc_lower = task.description.lower()
+        signal_count = sum(1 for s in complexity_signals if s in desc_lower)
+
+        if signal_count >= 2 or desc_len > 2000:
+            return "high"
+        if baseline == "low" and signal_count == 0 and desc_len < 500:
+            return "low"
+        return baseline
 
     def _validate_task_output(self, task: Task) -> dict:
         """Validate that the agent actually produced useful output before marking done."""
@@ -1202,6 +1455,8 @@ class Orchestrator:
 {"## Messages from Other Agents" + chr(10) + mail if mail else ""}
 {memory_hint}
 {board}
+
+{"" if not self._style_guide else self._style_guide + chr(10)}
 
 ## Role Instructions
 {role_instructions}

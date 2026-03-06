@@ -12,12 +12,15 @@ The discovery engine:
 """
 
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,6 +60,9 @@ class DiscoveryEngine:
 
     def discover_all(self, goal: str = "") -> list[DiscoveredWork]:
         """Run all discovery sources and return prioritized work items."""
+        # Clear codebase cache so we pick up new files from previous agents
+        if hasattr(self, '_codebase_cache'):
+            del self._codebase_cache
         work: list[DiscoveredWork] = []
 
         work.extend(self._scan_vision_gaps())
@@ -67,16 +73,68 @@ class DiscoveryEngine:
         work.extend(self._scan_missing_docs())
         work.extend(self._scan_security_issues())
 
-        # Deduplicate against already-known tasks (case-insensitive + prefix match)
-        known_ids = self._load_known_task_titles()
-        work = [w for w in work
-                if w.title.strip().lower() not in known_ids
-                and w.title.strip().lower()[:60] not in known_ids]
+        # Deduplicate against already-known tasks using fuzzy matching
+        known_titles, known_prefixes, failed_titles = self._load_known_task_titles()
+        filtered = []
+        for w in work:
+            title_lower = w.title.strip().lower()
+            # Exact match
+            if title_lower in known_titles:
+                continue
+            # Prefix match (first 60 chars)
+            if title_lower[:60] in known_prefixes:
+                continue
+            # Normalized match (strip common prefixes like [BUG], [TODO], Fix:, etc.)
+            normalized = self._normalize_title(title_lower)
+            if normalized in known_titles or normalized[:60] in known_prefixes:
+                continue
+            # Skip tasks that already failed — don't rediscover the same bug
+            if normalized in failed_titles or normalized[:60] in failed_titles:
+                continue
+            # Skip if any known title contains the core of this title (substring match)
+            core = normalized[:40]
+            if len(core) >= 10 and any(core in kt for kt in known_titles if len(kt) > 10):
+                continue
+            filtered.append(w)
 
         # Sort by priority
-        work.sort(key=lambda w: w.priority, reverse=True)
+        filtered.sort(key=lambda w: w.priority, reverse=True)
 
-        return work
+        # Similarity dedup: within the batch itself, skip items too similar to each other
+        # This catches cases like 10 "log.debug" TODOs that are technically unique
+        deduplicated = []
+        for w in filtered:
+            w_norm = self._normalize_title(w.title.lower())
+            # Check similarity against items already in this batch
+            too_similar = False
+            for existing in deduplicated:
+                e_norm = self._normalize_title(existing.title.lower())
+                # If the first 30 chars match, or they share >60% words, skip
+                if w_norm[:30] == e_norm[:30]:
+                    too_similar = True
+                    break
+                w_words = set(w_norm.split())
+                e_words = set(e_norm.split())
+                if w_words and e_words:
+                    overlap = len(w_words & e_words) / max(len(w_words), len(e_words))
+                    if overlap > 0.6:
+                        too_similar = True
+                        break
+            if not too_similar:
+                deduplicated.append(w)
+
+        return deduplicated[:8]  # Hard cap: max 8 tasks per discovery cycle
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """Strip common prefixes/brackets to get the core title for dedup."""
+        # Remove [BUG], [TODO], [FIXME] etc.
+        title = re.sub(r'^\[[\w]+\]\s*', '', title)
+        # Remove "Fix:", "Build:", "Write tests for:", "Implement:" etc.
+        title = re.sub(r'^(fix|build|implement|design|write tests for|review|future)[:\s]+', '', title, flags=re.IGNORECASE)
+        # Remove "Fix failing test:" prefix
+        title = re.sub(r'^fix failing test[:\s]+', '', title, flags=re.IGNORECASE)
+        return title.strip()
 
     def _scan_vision_gaps(self) -> list[DiscoveredWork]:
         """Read VISION.md and find features that don't exist in the codebase yet.
@@ -131,9 +189,10 @@ class DiscoveryEngine:
                 )
 
                 # Architecture task first — Sonnet designs it
+                design_title = f"Design: {feature_name[:70]}"
                 items.append(DiscoveredWork(
                     source="vision",
-                    title=f"Design: {feature_name[:70]}",
+                    title=design_title,
                     description=(
                         f"Design the architecture for: {feature_name}\n\n"
                         f"Requirements:\n" +
@@ -146,13 +205,17 @@ class DiscoveryEngine:
                     priority=72,
                 ))
 
-                # Implementation task — Codex builds it
+                # Implementation task — Codex builds it (depends on design)
                 items.append(DiscoveredWork(
                     source="vision",
                     title=f"Implement: {feature_name[:70]}",
-                    description=description,
+                    description=(
+                        description +
+                        f"\n\n⚠️ DEPENDS ON: \"{design_title}\" — "
+                        "wait for design task to complete before implementing."
+                    ),
                     task_type=self._infer_task_type(feature_name + " " + feature_body),
-                    priority=70,
+                    priority=68,  # Lower than design (72) so design dispatches first
                 ))
 
         # --- Parse "## Future Features" section for lower-priority ideas ---
@@ -174,7 +237,7 @@ class DiscoveryEngine:
                         priority=35,  # Lower priority than core features
                     ))
 
-        return items[:15]  # Cap per cycle
+        return items[:8]  # Cap vision items per cycle — avoid queuing too many ambitious features
 
     def _extract_keywords(self, name: str, body: str) -> list[str]:
         """Extract searchable keywords from a feature description."""
@@ -194,27 +257,50 @@ class DiscoveryEngine:
                 unique.append(k)
         return unique[:10]  # Top 10 keywords
 
-    def _keywords_in_codebase(self, keywords: list[str], threshold: float = 0.4) -> bool:
-        """Check if enough keywords appear in the codebase to suggest implementation exists."""
+    def _keywords_in_codebase(self, keywords: list[str], threshold: float = 0.6) -> bool:
+        """Check if enough keywords appear in the codebase to suggest implementation exists.
+
+        Uses pure Python instead of grep for Windows compatibility.
+        """
         if not keywords:
             return False
 
-        found = 0
-        for kw in keywords[:8]:
-            try:
-                result = subprocess.run(
-                    ["grep", "-rl", "--include=*.py", "--include=*.js", "--include=*.ts",
-                     "--exclude-dir=node_modules", "--exclude-dir=.forge",
-                     "--exclude-dir=venv", "--exclude-dir=__pycache__",
-                     "-i", kw],
-                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
-                )
-                if result.stdout.strip():
-                    found += 1
-            except (subprocess.TimeoutExpired, Exception):
-                pass
+        skip_dirs = {".forge", "venv", ".venv", "node_modules", "__pycache__", ".git", "dist", "build"}
+        # Build a cache of file contents on first call (scan up to 100 files)
+        if not hasattr(self, '_codebase_cache'):
+            self._codebase_cache = []
+            # Collect all candidate files first, then cap — avoids bias toward first extension
+            all_files = []
+            for ext in ["*.py", "*.js", "*.ts", "*.tsx", "*.jsx"]:
+                for f in self.project_dir.rglob(ext):
+                    if any(part in skip_dirs for part in f.parts):
+                        continue
+                    all_files.append(f)
+                    if len(all_files) >= 500:  # Safety cap on scanning
+                        break
+                if len(all_files) >= 500:
+                    break
+            # Evenly sample if over limit
+            if len(all_files) > 100:
+                import random
+                all_files = random.sample(all_files, 100)
+            for f in all_files:
+                try:
+                    self._codebase_cache.append(f.read_text(encoding="utf-8", errors="replace").lower())
+                except (OSError, PermissionError):
+                    pass
 
-        return (found / len(keywords)) >= threshold
+        checked = keywords[:8]
+        if not checked:
+            return False
+
+        found = 0
+        for kw in checked:
+            kw_lower = kw.lower()
+            if any(kw_lower in content for content in self._codebase_cache):
+                found += 1
+
+        return (found / len(checked)) >= threshold
 
     def _evidence_exists(self, description: str) -> bool:
         """Quick check if a feature description matches anything in the codebase."""
@@ -247,9 +333,30 @@ class DiscoveryEngine:
         best = max(scores, key=scores.get)
         return best if scores[best] > 0 else "backend"  # Default to backend
 
+    def _infer_task_type_from_file(self, file_path: str, comment: str = "") -> str:
+        """Infer task type from file extension and path, falling back to comment keywords."""
+        path_lower = file_path.lower()
+        if any(path_lower.endswith(ext) for ext in (".jsx", ".tsx", ".css", ".scss", ".html")):
+            return "frontend"
+        if "test" in path_lower or "spec" in path_lower:
+            return "testing"
+        if any(seg in path_lower for seg in ("docs/", "readme", "guide")):
+            return "docs"
+        # Fall back to keyword-based inference from comment text
+        if comment:
+            return self._infer_task_type(comment)
+        return "backend"
+
     def _scan_todos(self) -> list[DiscoveredWork]:
-        """Find TODO, FIXME, HACK, XXX comments in code."""
+        """Find TODO, FIXME, HACK, XXX comments in code.
+
+        Deduplicates by file:line to avoid creating multiple tasks for
+        the same comment discovered across cycles. Uses pure Python for
+        Windows compatibility.
+        """
         items = []
+        seen_locations = set()  # "filepath:linenum" dedup
+        seen_comments = set()   # comment text dedup
         patterns = {
             "TODO": 60,
             "FIXME": 80,
@@ -257,63 +364,110 @@ class DiscoveryEngine:
             "XXX": 75,
             "BUG": 90,
         }
+        # Pre-compile word-boundary regexes to avoid false positives
+        # (e.g. "debug" matching "BUG", "toDoSomething" matching "TODO")
+        pattern_regexes = {p: re.compile(rf'\b{p}\b', re.IGNORECASE) for p in patterns}
+        skip_dirs = {"node_modules", ".forge", "venv", ".venv", "__pycache__", ".git", "dist", "build"}
+        extensions = {".py", ".js", ".ts", ".jsx", ".tsx"}
 
         try:
-            for pattern, priority in patterns.items():
-                result = subprocess.run(
-                    ["grep", "-rn", pattern, "--include=*.py", "--include=*.js",
-                     "--include=*.ts", "--include=*.jsx", "--include=*.tsx",
-                     "--exclude-dir=node_modules", "--exclude-dir=.forge",
-                     "--exclude-dir=venv", "--exclude-dir=__pycache__"],
-                    cwd=self.project_dir, capture_output=True, text=True, timeout=30,
-                )
-                for line in result.stdout.strip().split("\n"):
-                    if not line:
-                        continue
-                    parts = line.split(":", 2)
-                    if len(parts) >= 3:
-                        filepath, linenum, content = parts[0], parts[1], parts[2]
+            file_count = 0
+            for f in self.project_dir.rglob("*"):
+                if f.suffix not in extensions:
+                    continue
+                if any(part in skip_dirs for part in f.parts):
+                    continue
+                file_count += 1
+                if file_count > 200:
+                    break
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                except (OSError, PermissionError):
+                    continue
+                rel_path = str(f.relative_to(self.project_dir))
+                for line_num, line in enumerate(content.split("\n"), 1):
+                    for pattern, priority in patterns.items():
+                        if not pattern_regexes[pattern].search(line):
+                            continue
+                        # Deduplicate by location
+                        loc_key = f"{rel_path}:{line_num}"
+                        if loc_key in seen_locations:
+                            continue
+                        seen_locations.add(loc_key)
+
                         # Extract the actual comment
-                        comment = content.strip()
-                        # Remove the pattern prefix to get the description
+                        comment = line.strip()
                         for p in patterns:
                             comment = re.sub(rf'{p}[:\s]*', '', comment, flags=re.IGNORECASE)
                         comment = comment.strip().strip('#').strip('//').strip('/*').strip('*/').strip()
 
-                        if len(comment) > 5:  # Skip empty TODOs
-                            items.append(DiscoveredWork(
-                                source="todo",
-                                title=f"[{pattern}] {comment[:80]}",
-                                description=f"Found {pattern} at {filepath}:{linenum}\n\n{content.strip()}",
-                                task_type="backend",  # Will be refined
-                                priority=priority,
-                                file_path=filepath,
-                                line_number=int(linenum) if linenum.isdigit() else 0,
-                            ))
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+                        if len(comment) < 10:
+                            continue
 
-        return items[:20]  # Cap at 20 to avoid flooding
+                        # Deduplicate by comment text
+                        comment_key = comment.lower()[:60]
+                        if comment_key in seen_comments:
+                            continue
+                        seen_comments.add(comment_key)
+
+                        items.append(DiscoveredWork(
+                            source="todo",
+                            title=f"[{pattern}] {comment[:80]}",
+                            description=f"Found {pattern} at {rel_path}:{line_num}\n\n{line.strip()}",
+                            task_type=self._infer_task_type_from_file(rel_path, comment),
+                            priority=priority,
+                            file_path=rel_path,
+                            line_number=line_num,
+                        ))
+                        break  # One pattern match per line
+        except Exception:
+            _log.debug("TODO scan error", exc_info=True)
+
+        return items[:5]  # Cap at 5 to avoid flooding the task queue
 
     def _scan_missing_tests(self) -> list[DiscoveredWork]:
         """Find source files that don't have corresponding test files."""
         items = []
 
-        src_files = list(self.project_dir.rglob("*.py"))
-        src_files = [f for f in src_files if "test" not in f.name.lower()
-                     and "__pycache__" not in str(f)
-                     and ".forge" not in str(f)
-                     and "venv" not in str(f)
-                     and f.name != "__init__.py"]
+        # Skip temp files, migrations, configs, and generated files
+        skip_names = {"__init__", "setup", "conftest", "manage", "wsgi", "asgi",
+                      "settings", "config", "migrations", "alembic"}
+        skip_prefixes = ("temp_", "tmp_", "old_", "backup_", "copy_")
+        skip_dirs = {"__pycache__", ".forge", "venv", ".venv", "node_modules",
+                     "migrations", ".git", "dist", "build"}
 
-        test_dir = self.project_dir / "tests"
+        src_files = []
+        for f in self.project_dir.rglob("*.py"):
+            if any(part in skip_dirs for part in f.parts):
+                continue
+            if ("test" not in f.name.lower()
+                     and f.name != "__init__.py"
+                     and f.stem not in skip_names
+                     and not f.stem.startswith(skip_prefixes)):
+                src_files.append(f)
+            if len(src_files) >= 100:  # Safety cap for large repos
+                break
+
+        # Collect existing test coverage from multiple patterns:
+        #   tests/test_*.py, test/*.py, **/test_*.py, **/*_test.py
         existing_tests = set()
-        if test_dir.exists():
-            existing_tests = {f.stem.replace("test_", "") for f in test_dir.rglob("test_*.py")}
+        for test_pattern in ["tests/test_*.py", "test/test_*.py", "**/test_*.py", "**/*_test.py"]:
+            for tf in self.project_dir.glob(test_pattern):
+                stem = tf.stem
+                # Normalize: test_foo -> foo, foo_test -> foo
+                if stem.startswith("test_"):
+                    stem = stem[5:]
+                elif stem.endswith("_test"):
+                    stem = stem[:-5]
+                existing_tests.add(stem)
 
         for src in src_files:
             module_name = src.stem
             if module_name not in existing_tests and module_name != "main":
+                # Also check for a co-located test file (test_foo.py next to foo.py)
+                colocated = src.parent / f"test_{module_name}.py"
+                if colocated.exists():
+                    continue
                 rel_path = src.relative_to(self.project_dir)
                 items.append(DiscoveredWork(
                     source="missing_test",
@@ -326,11 +480,14 @@ class DiscoveryEngine:
 
         # Also check JS/TS files
         for ext in ["*.js", "*.ts", "*.jsx", "*.tsx"]:
-            js_files = list(self.project_dir.rglob(ext))
-            js_files = [f for f in js_files if "test" not in f.name.lower()
-                        and "node_modules" not in str(f)
-                        and ".forge" not in str(f)
-                        and f.name not in ("index.js", "index.ts")]
+            js_files = []
+            for f in self.project_dir.rglob(ext):
+                if any(part in skip_dirs for part in f.parts):
+                    continue
+                if "test" not in f.name.lower() and f.name not in ("index.js", "index.ts"):
+                    js_files.append(f)
+                if len(js_files) >= 50:
+                    break
 
             for src in js_files:
                 test_variants = [
@@ -348,7 +505,7 @@ class DiscoveryEngine:
                         file_path=str(rel_path),
                     ))
 
-        return items[:15]
+        return items[:5]
 
     def _scan_lint_errors(self) -> list[DiscoveredWork]:
         """Run linter and collect errors."""
@@ -378,31 +535,44 @@ class DiscoveryEngine:
         except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
             pass
 
-        return items[:10]
+        return items[:5]
 
     def _scan_failed_tests(self) -> list[DiscoveredWork]:
-        """Check for previously failed tests."""
+        """Check for previously failed tests.
+
+        Only scans recent logs (last 2 hours) and deduplicates by test name.
+        """
         items = []
+        seen_tests = set()
+        cutoff = datetime.now().timestamp() - 7200  # 2 hours ago
 
         # Look for pytest failure logs
         log_dir = self.forge_dir / "logs"
         if log_dir.exists():
             for log_file in log_dir.glob("*.log"):
-                content = log_file.read_text(errors="ignore")
-                if "FAILED" in content or "ERROR" in content:
-                    # Extract failed test names
+                try:
+                    if log_file.stat().st_mtime < cutoff:
+                        continue  # Skip old logs
+                except OSError:
+                    continue
+                content = log_file.read_text(encoding="utf-8", errors="replace")
+                if "FAILED" in content:
                     failed = re.findall(r'FAILED\s+([\w/:.]+)', content)
-                    for test in failed[:5]:
+                    for test in failed[:3]:
+                        test_name = test.split('::')[-1] if '::' in test else test
+                        if test_name in seen_tests:
+                            continue
+                        seen_tests.add(test_name)
                         items.append(DiscoveredWork(
                             source="failed_test",
-                            title=f"Fix failing test: {test.split('::')[-1] if '::' in test else test}",
+                            title=f"Fix failing test: {test_name}",
                             description=f"Test {test} is failing. Check the log at {log_file.name}",
                             task_type="backend",
                             priority=85,
                             file_path=test.split("::")[0] if "::" in test else "",
                         ))
 
-        return items[:10]
+        return items[:5]
 
     def _scan_missing_docs(self) -> list[DiscoveredWork]:
         """Check for missing or outdated documentation."""
@@ -419,7 +589,7 @@ class DiscoveryEngine:
             ))
         else:
             # README exists but may be stale — check if it's very short
-            readme = (self.project_dir / "README.md").read_text(errors="replace")
+            readme = (self.project_dir / "README.md").read_text(encoding="utf-8", errors="replace")
             if len(readme) < 200:
                 items.append(DiscoveredWork(
                     source="missing_docs",
@@ -430,13 +600,18 @@ class DiscoveryEngine:
                 ))
 
         # Check for public Python files without module docstrings
-        py_files = list(self.project_dir.rglob("*.py"))
-        undocumented = []
-        for f in py_files[:50]:  # Cap scanning
-            if ".forge" in str(f) or "venv" in str(f) or "__pycache__" in str(f):
+        _skip_dirs = {".forge", "venv", ".venv", "__pycache__", "node_modules", ".git", "dist", "build"}
+        py_files = []
+        for f in self.project_dir.rglob("*.py"):
+            if any(part in _skip_dirs for part in f.parts):
                 continue
+            py_files.append(f)
+            if len(py_files) >= 50:
+                break
+        undocumented = []
+        for f in py_files:
             try:
-                content = f.read_text(errors="replace")
+                content = f.read_text(encoding="utf-8", errors="replace")
                 # Check if file has classes/functions but no module docstring
                 if ("def " in content or "class " in content) and not content.strip().startswith('"""') and not content.strip().startswith("'''"):
                     undocumented.append(str(f.relative_to(self.project_dir)))
@@ -454,14 +629,14 @@ class DiscoveryEngine:
 
         # Check for API files without inline docs
         api_patterns = ["api", "routes", "views", "endpoints", "handlers"]
-        for f in py_files:
+        for f in py_files[:50]:
             fname = f.name.lower()
             if any(p in fname for p in api_patterns):
                 try:
-                    content = f.read_text(errors="replace")
+                    content = f.read_text(encoding="utf-8", errors="replace")
                     func_count = content.count("def ")
                     doc_count = content.count('"""')
-                    if func_count > 3 and doc_count < func_count:
+                    if func_count > 3 and doc_count // 2 < func_count:
                         items.append(DiscoveredWork(
                             source="missing_docs",
                             title=f"Document API functions in {f.name}",
@@ -477,61 +652,88 @@ class DiscoveryEngine:
         return items
 
     def _scan_security_issues(self) -> list[DiscoveredWork]:
-        """Basic security scanning."""
+        """Basic security scanning. Uses pure Python for Windows compatibility."""
         items = []
 
-        # Check for hardcoded secrets patterns
         secret_patterns = [
-            r'(?:api_key|apikey|secret|password|token)\s*=\s*["\'][^"\']{8,}["\']',
-            r'sk-[a-zA-Z0-9]{20,}',
-            r'AKIA[0-9A-Z]{16}',
+            re.compile(r'(?:api_key|apikey|secret|password|token)\s*=\s*["\'][^"\']{8,}["\']', re.IGNORECASE),
+            re.compile(r'sk-[a-zA-Z0-9]{20,}'),
+            re.compile(r'AKIA[0-9A-Z]{16}'),
         ]
+        skip_dirs = {"node_modules", ".forge", "venv", ".venv", "__pycache__", ".git", "dist", "build"}
+        extensions = {".py", ".js", ".ts", ".env"}
 
         try:
-            for pattern in secret_patterns:
-                result = subprocess.run(
-                    ["grep", "-rn", "-E", pattern,
-                     "--include=*.py", "--include=*.js", "--include=*.ts",
-                     "--include=*.env", "--exclude-dir=node_modules",
-                     "--exclude-dir=.forge", "--exclude-dir=venv"],
-                    cwd=self.project_dir, capture_output=True, text=True, timeout=15,
-                )
-                for line in result.stdout.strip().split("\n"):
-                    if line and ".env.example" not in line and ".env.sample" not in line:
-                        parts = line.split(":", 2)
-                        if len(parts) >= 2:
+            file_count = 0
+            for f in self.project_dir.rglob("*"):
+                if f.suffix not in extensions:
+                    continue
+                if any(part in skip_dirs for part in f.parts):
+                    continue
+                if ".env.example" in f.name or ".env.sample" in f.name:
+                    continue
+                # Skip test files — they often contain mock secrets/tokens
+                if "test" in f.name.lower() or "spec" in f.name.lower() or "fixture" in f.name.lower():
+                    continue
+                file_count += 1
+                if file_count > 100:
+                    break
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                except (OSError, PermissionError):
+                    continue
+                rel_path = str(f.relative_to(self.project_dir))
+                for line_num, line in enumerate(content.split("\n"), 1):
+                    for pattern in secret_patterns:
+                        if pattern.search(line):
                             items.append(DiscoveredWork(
                                 source="security",
-                                title=f"Potential hardcoded secret in {Path(parts[0]).name}",
-                                description=f"Found what looks like a hardcoded secret at {parts[0]}:{parts[1]}",
+                                title=f"Potential hardcoded secret in {f.name}",
+                                description=f"Found what looks like a hardcoded secret at {rel_path}:{line_num}",
                                 task_type="review",
                                 priority=95,
-                                file_path=parts[0],
-                                line_number=int(parts[1]) if parts[1].isdigit() else 0,
+                                file_path=rel_path,
+                                line_number=line_num,
                             ))
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+                            break
+        except Exception:
+            _log.debug("Security scan error", exc_info=True)
 
         return items[:5]
 
-    def _load_known_task_titles(self) -> set:
+    def _load_known_task_titles(self) -> tuple[set, set, set]:
         """Load titles of tasks already on the board to avoid duplicates.
 
-        Uses case-insensitive matching AND prefix matching (first 60 chars)
-        to catch near-duplicates from slightly different discovery runs.
+        Returns:
+            (exact_titles, prefix_titles, failed_titles) — all lowercase.
+            failed_titles contains normalized titles of tasks that already failed,
+            so we don't rediscover the same broken thing.
         """
         titles = set()
+        prefixes = set()
+        failed = set()
         tasks_dir = self.forge_dir / "tasks"
         if tasks_dir.exists():
             for f in tasks_dir.glob("*.json"):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
                     title = data.get("title", "").strip().lower()
+                    if not title:
+                        continue  # Skip empty titles — they poison prefix matching
+                    normalized = self._normalize_title(title)
                     titles.add(title)
-                    titles.add(title[:60])  # Prefix match catches truncation diffs
+                    if normalized:
+                        titles.add(normalized)
+                    prefixes.add(title[:60])
+                    if normalized:
+                        prefixes.add(normalized[:60])
+                    # Track failed tasks so we don't rediscover them
+                    if data.get("status") == "failed":
+                        failed.add(normalized)
+                        failed.add(normalized[:60])
                 except (json.JSONDecodeError, KeyError):
                     pass
-        return titles
+        return titles, prefixes, failed
 
     def get_project_health(self) -> dict:
         """Calculate a project health score for ship-readiness.
@@ -547,20 +749,30 @@ class DiscoveryEngine:
         score = 0
 
         # ── Tests (30 pts) ──
-        src_files = [f for f in self.project_dir.rglob("*.py")
-                     if "test" not in f.name.lower() and "__pycache__" not in str(f)
-                     and ".forge" not in str(f) and "venv" not in str(f)
-                     and "node_modules" not in str(f) and f.name != "__init__.py"]
-        test_files = [f for f in self.project_dir.rglob("test_*.py")
-                      if "__pycache__" not in str(f)]
-        # Also count JS/TS test files
-        for pattern in ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts",
-                        "*.test.jsx", "*.test.tsx", "*.spec.jsx", "*.spec.tsx"]:
-            test_files.extend(self.project_dir.rglob(pattern))
-        for pattern in ["*.js", "*.ts", "*.jsx", "*.tsx"]:
-            src_files.extend(f for f in self.project_dir.rglob(pattern)
-                           if "test" not in f.name.lower() and "spec" not in f.name.lower()
-                           and "node_modules" not in str(f) and ".forge" not in str(f))
+        _skip = {"__pycache__", ".forge", "venv", ".venv", "node_modules", ".git", "dist", "build"}
+        src_files = []
+        test_files = []
+        for f in self.project_dir.rglob("*.py"):
+            if any(part in _skip for part in f.parts):
+                continue
+            if f.name.startswith("test_") or "test" in f.name.lower():
+                test_files.append(f)
+            elif f.name != "__init__.py":
+                src_files.append(f)
+            if len(src_files) + len(test_files) > 200:
+                break
+        # Also count JS/TS files
+        for ext in ["*.js", "*.ts", "*.jsx", "*.tsx"]:
+            for f in self.project_dir.rglob(ext):
+                if any(part in _skip for part in f.parts):
+                    continue
+                name_lower = f.name.lower()
+                if "test" in name_lower or "spec" in name_lower:
+                    test_files.append(f)
+                else:
+                    src_files.append(f)
+                if len(src_files) + len(test_files) > 300:
+                    break
 
         src_count = len(src_files)
         test_count = len(test_files)
@@ -610,11 +822,36 @@ class DiscoveryEngine:
         score += test_total
 
         # ── Code quality (25 pts) ──
-        # TODOs: weighted by severity
-        todos = self._scan_todos()
-        fixme_count = sum(1 for t in todos if "FIXME" in t.title or "BUG" in t.title)
-        hack_count = sum(1 for t in todos if "HACK" in t.title or "XXX" in t.title)
-        todo_count = len(todos) - fixme_count - hack_count
+        # Count TODOs directly (not via _scan_todos which caps at 5)
+        todo_count = 0
+        fixme_count = 0
+        hack_count = 0
+        _todo_re = re.compile(r'\b(TODO|FIXME|HACK|XXX|BUG)\b', re.IGNORECASE)
+        _skip_dirs_q = {"node_modules", ".forge", "venv", ".venv", "__pycache__", ".git", "dist", "build"}
+        _extensions_q = {".py", ".js", ".ts", ".jsx", ".tsx"}
+        _file_count_q = 0
+        for f in self.project_dir.rglob("*"):
+            if f.suffix not in _extensions_q:
+                continue
+            if any(part in _skip_dirs_q for part in f.parts):
+                continue
+            _file_count_q += 1
+            if _file_count_q > 200:
+                break
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except (OSError, PermissionError):
+                continue
+            for line in content.split("\n"):
+                for m in _todo_re.finditer(line):
+                    tag = m.group(1).upper()
+                    if tag in ("FIXME", "BUG"):
+                        fixme_count += 1
+                    elif tag in ("HACK", "XXX"):
+                        hack_count += 1
+                    else:
+                        todo_count += 1
+                    break  # One match per line
         breakdown["todos"] = todo_count
         breakdown["fixmes"] = fixme_count
         breakdown["hacks"] = hack_count

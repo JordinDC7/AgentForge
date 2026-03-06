@@ -34,6 +34,12 @@ class DependencyGraph:
     def add_task(self, task_id: str, depends_on: list[str] | None = None):
         self._all_nodes.add(task_id)
         deps = depends_on or []
+        # Clean up stale reverse edges before overwriting
+        old_deps = self._edges.get(task_id, [])
+        for old_dep in old_deps:
+            rev = self._reverse.get(old_dep, [])
+            if task_id in rev:
+                rev.remove(task_id)
         self._edges[task_id] = deps
         for dep in deps:
             self._all_nodes.add(dep)
@@ -41,7 +47,17 @@ class DependencyGraph:
 
     def remove_task(self, task_id: str):
         self._all_nodes.discard(task_id)
+        # Clean up reverse edges for this task's dependencies
+        for dep in self._edges.get(task_id, []):
+            rev = self._reverse.get(dep, [])
+            if task_id in rev:
+                rev.remove(task_id)
         self._edges.pop(task_id, None)
+        # Remove this task from other tasks' dependency lists
+        for node, deps in self._edges.items():
+            if task_id in deps:
+                deps.remove(task_id)
+        # Clean up reverse edges where this task is a dependency
         for dep, dependents in self._reverse.items():
             if task_id in dependents:
                 dependents.remove(task_id)
@@ -89,11 +105,6 @@ class DependencyGraph:
         """
         in_degree = {n: 0 for n in self._all_nodes}
         for node, deps in self._edges.items():
-            for dep in deps:
-                if dep in in_degree:
-                    # node depends on dep, so dep must come first
-                    # But in_degree tracks how many things point TO a node
-                    pass
             in_degree[node] = len([d for d in deps if d in self._all_nodes])
 
         queue = deque(n for n, d in in_degree.items() if d == 0)
@@ -169,10 +180,11 @@ class DependencyGraph:
                     dist[dependent] = new_dist
                     pred[dependent] = node
 
-        # Find the end of the critical path
+        # Find the end of the critical path (include each node's own duration)
         if not dist:
             return []
-        end_node = max(dist, key=dist.get)
+        total_dist = {n: dist[n] + estimates.get(n, 1.0) for n in self._all_nodes}
+        end_node = max(total_dist, key=total_dist.get)
         path = []
         cur: str | None = end_node
         while cur is not None:

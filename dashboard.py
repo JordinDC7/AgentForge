@@ -25,7 +25,7 @@ def get_tasks():
     tasks = []
     for f in sorted(tasks_dir.glob("*.json")):
         try:
-            tasks.append(json.loads(f.read_text()))
+            tasks.append(json.loads(f.read_text(encoding="utf-8", errors="replace")))
         except Exception:
             pass
     return tasks
@@ -38,7 +38,7 @@ def get_locks():
     locks = {}
     for f in locks_dir.glob("*.lock"):
         try:
-            locks[f.stem] = json.loads(f.read_text())
+            locks[f.stem] = json.loads(f.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             pass
     return locks
@@ -49,20 +49,25 @@ def get_logs(task_id=None, tail=80):
     if not logs_dir.exists():
         return []
     logs = []
-    for f in sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True):
+    try:
+        log_files = sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+    except (OSError, FileNotFoundError):
+        return []
+    for f in log_files:
         if task_id and task_id not in f.name:
             continue
         try:
-            content = f.read_text(errors="replace")
+            stat = f.stat()
+            content = f.read_text(encoding="utf-8", errors="replace")
             lines = content.strip().split("\n")
             logs.append({
                 "name": f.name,
-                "size": f.stat().st_size,
-                "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "tail": "\n".join(lines[-tail:]),
                 "lines": len(lines),
             })
-        except Exception:
+        except (FileNotFoundError, OSError, Exception):
             pass
     return logs[:20]
 
@@ -71,13 +76,13 @@ def get_budget():
     budget_file = FORGE_DIR / "budget" / "spending.json"
     if budget_file.exists():
         try:
-            return json.loads(budget_file.read_text())
+            return json.loads(budget_file.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             pass
     summary_file = FORGE_DIR / "budget" / "run_summary.json"
     if summary_file.exists():
         try:
-            return json.loads(summary_file.read_text())
+            return json.loads(summary_file.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             pass
     return {}
@@ -87,7 +92,7 @@ def get_health():
     health_file = FORGE_DIR / "memory" / "health_history.json"
     if health_file.exists():
         try:
-            history = json.loads(health_file.read_text())
+            history = json.loads(health_file.read_text(encoding="utf-8", errors="replace"))
             return history[-1] if history else {}
         except Exception:
             pass
@@ -98,7 +103,7 @@ def get_token_ledger(tail=20):
     ledger_file = FORGE_DIR / "budget" / "token_ledger.json"
     if ledger_file.exists():
         try:
-            entries = json.loads(ledger_file.read_text())
+            entries = json.loads(ledger_file.read_text(encoding="utf-8", errors="replace"))
             return entries[-tail:]
         except Exception:
             pass
@@ -109,7 +114,7 @@ def get_shared_context():
     ctx_file = FORGE_DIR / "context" / "SHARED.md"
     if ctx_file.exists():
         try:
-            return ctx_file.read_text(errors="replace")[:5000]
+            return ctx_file.read_text(encoding="utf-8", errors="replace")[:5000]
         except Exception:
             pass
     return ""
@@ -127,7 +132,7 @@ def get_mail():
                     messages.append({
                         "to": agent_dir.name,
                         "file": f.name,
-                        "content": f.read_text(errors="replace")[:500],
+                        "content": f.read_text(encoding="utf-8", errors="replace")[:500],
                     })
                 except Exception:
                     pass
@@ -151,7 +156,7 @@ def get_events(tail=30):
     if not events_file.exists():
         return []
     try:
-        lines = events_file.read_text().strip().split("\n")
+        lines = events_file.read_text(encoding="utf-8", errors="replace").strip().split("\n")
         events = []
         for line in lines[-tail:]:
             try:
@@ -627,9 +632,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             data = build_api_response()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin", "http://localhost:8420")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+            self.wfile.write(json.dumps(data, default=str).encode())
         elif parsed.path == "/" or parsed.path == "/index.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -650,7 +655,7 @@ def main():
         print(f"  Run 'python forge.py init' first, or cd into your project directory.")
         return
 
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
     print(f"⚡ AgentForge Dashboard")
     print(f"   Project: {PROJECT_DIR.name}")
     print(f"   URL:     http://localhost:{port}")

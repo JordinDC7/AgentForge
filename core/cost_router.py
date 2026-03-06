@@ -97,23 +97,32 @@ class CostRouter:
         min_accuracy = COMPLEXITY_MIN_ACCURACY[complexity]
 
         # Build set of providers to avoid based on failure history
-        # If a provider has failed 2+ times on this task type, skip it
+        # If a provider has failed 1+ times on this task type, deprioritize it
         failed_providers = set()
         if failure_history:
             for key, count in failure_history.items():
                 parts = key.split(":", 1)
-                if len(parts) == 2 and parts[0] == task_type and count >= 2:
+                if len(parts) == 2 and parts[0] == task_type and count >= 1:
                     failed_providers.add(parts[1])
 
-        # User override — just use what they asked for
+        # User override — use what they asked for, but still check budget
         if preferred_provider:
             for p in self.providers:
                 if p.name == preferred_provider:
                     cost = p.estimate_cost(estimated_duration_minutes * 60)
+                    fallback = None
+                    more_capable = [
+                        q for q in self.providers
+                        if q.name != preferred_provider and q.config.accuracy_score > p.config.accuracy_score
+                    ]
+                    if more_capable:
+                        more_capable.sort(key=lambda q: q.config.cost_per_hour_usd)
+                        fallback = more_capable[0]
                     return RouteDecision(
                         provider=p,
                         reason=f"User preferred provider: {preferred_provider}",
                         estimated_cost=cost,
+                        fallback=fallback,
                     )
 
         # Filter: has capabilities AND meets accuracy threshold
@@ -131,7 +140,7 @@ class CostRouter:
             candidates = sorted(self.providers, key=lambda p: p.config.accuracy_score, reverse=True)
 
         if not candidates:
-            raise RuntimeError("No providers available. Run 'forge providers setup' first.")
+            raise RuntimeError("No providers available. Run 'forge providers' to see install instructions.")
 
         # Sort by cost tier, then by cost_per_hour
         tier_order = {CostTier.FREE: 0, CostTier.SUBSCRIPTION: 1, CostTier.LOW: 2, CostTier.MEDIUM: 3, CostTier.HIGH: 4}
@@ -149,20 +158,16 @@ class CostRouter:
         chosen = candidates[0]
         cost = chosen.estimate_cost(estimated_duration_minutes * 60)
 
-        # Set fallback (next provider that's more accurate)
+        # Set fallback: prefer higher-accuracy, otherwise just the next provider
         fallback = None
         more_capable = [p for p in candidates[1:] if p.config.accuracy_score > chosen.config.accuracy_score]
         if more_capable:
             fallback = more_capable[0]
+        elif len(candidates) > 1:
+            fallback = candidates[1]  # At least escalate to a different provider
 
-        # Budget check
-        if cost > self.budget_remaining and len(candidates) > 1:
-            # Try to find something cheaper
-            for p in candidates:
-                if p.estimate_cost(estimated_duration_minutes * 60) <= self.budget_remaining:
-                    chosen = p
-                    cost = p.estimate_cost(estimated_duration_minutes * 60)
-                    break
+        # Budget check — warn if estimated cost exceeds remaining budget
+        over_budget = cost > self.budget_remaining
 
         reason = (
             f"Routed to {chosen.name} ({chosen.config.cost_tier.value}): "
@@ -170,6 +175,8 @@ class CostRouter:
             f"cost=~${cost:.2f}, "
             f"complexity={complexity.value}"
         )
+        if over_budget:
+            reason += f" (WARNING: estimated cost ${cost:.2f} exceeds remaining budget ${self.budget_remaining:.2f})"
         if chosen.name in failed_providers:
             reason += " (WARNING: this provider has failed before on this task type)"
 
@@ -179,6 +186,10 @@ class CostRouter:
             estimated_cost=cost,
             fallback=fallback,
         )
+
+    def record_spend(self, amount_usd: float):
+        """Decrement budget after a task completes."""
+        self.budget_remaining -= amount_usd
 
     def get_escalation_chain(self, task_type: str) -> list[BaseProvider]:
         """Get the full escalation chain for a task type, cheapest to most expensive.

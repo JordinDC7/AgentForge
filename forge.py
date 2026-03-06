@@ -63,7 +63,7 @@ def cmd_init(args):
 - Run tests before every commit
 """
         for filename in ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]:
-            (Path.cwd() / filename).write_text(instructions)
+            (Path.cwd() / filename).write_text(instructions, encoding="utf-8")
         print(f"\n📄 Created CLAUDE.md, AGENTS.md, GEMINI.md (edit these with your project details)")
 
     # Create forge.yaml if it doesn't exist
@@ -87,7 +87,7 @@ escalation:
   - aider
   - claude
   - claude-opus
-""")
+""", encoding="utf-8")
         print(f"📄 Created forge.yaml (edit to set budget + routing)")
 
     print(f"\n✅ Forge initialized. Next steps:")
@@ -160,7 +160,7 @@ def cmd_plan(args):
 
     for task in tasks:
         task_file = forge_dir / f"{task['id']}.json"
-        task_file.write_text(json.dumps(task, indent=2))
+        task_file.write_text(json.dumps(task, indent=2), encoding="utf-8")
 
     # Show plan with cost estimates
     from providers.registry import detect_available_providers
@@ -222,7 +222,12 @@ def cmd_run(args):
 
     providers = detect_available_providers(plugin_dirs=plugin_dirs if plugin_dirs else None)
     if not providers:
-        print("❌ No providers available. Install at least one AI coding agent.")
+        print("❌ No providers available. Install at least one AI coding agent:")
+        print("   claude  → npm install -g @anthropic-ai/claude-code")
+        print("   codex   → npm install -g @openai/codex")
+        print("   gemini  → npm install -g @google/gemini-cli")
+        print("   aider   → pip install aider-chat")
+        print("\n   After installing, verify with: forge providers")
         return
 
     # Parse routing overrides: "backend=codex,frontend=gemini" → dict
@@ -249,25 +254,33 @@ def cmd_run(args):
     tasks_dir = Path.cwd() / FORGE_DIR / "tasks"
     if tasks_dir.exists():
         for task_file in sorted(tasks_dir.glob("*.json")):
-            data = json.loads(task_file.read_text())
-            task = Task(
-                id=data["id"], type=data["type"], title=data["title"],
-                description=data["description"],
-                priority=data.get("priority", 0),
-                depends_on=data.get("depends_on", []),
-                estimated_minutes=data.get("estimated_minutes", 30),
-                source=data.get("source", "manual"),
-            )
-            # Restore persisted status
-            persisted_status = data.get("status", "backlog")
-            status_map = {
-                "done": TaskStatus.DONE, "failed": TaskStatus.FAILED,
-                "in_progress": TaskStatus.IN_PROGRESS, "in_review": TaskStatus.IN_REVIEW,
-                "blocked": TaskStatus.BLOCKED, "ready": TaskStatus.READY,
-                "backlog": TaskStatus.BACKLOG,
-            }
-            task.status = status_map.get(persisted_status, TaskStatus.BACKLOG)
-            orch.add_task(task)
+            try:
+                data = json.loads(task_file.read_text(encoding="utf-8", errors="replace"))
+            except (json.JSONDecodeError, ValueError):
+                print(f"  ⚠ Skipping corrupted task file: {task_file.name}")
+                continue
+            try:
+                task = Task(
+                    id=data["id"], type=data["type"], title=data["title"],
+                    description=data["description"],
+                    priority=data.get("priority", 0),
+                    depends_on=data.get("depends_on", []),
+                    estimated_minutes=data.get("estimated_minutes", 30),
+                    source=data.get("source", "manual"),
+                )
+                # Restore persisted status
+                persisted_status = data.get("status", "backlog")
+                status_map = {
+                    "done": TaskStatus.DONE, "failed": TaskStatus.FAILED,
+                    "in_progress": TaskStatus.IN_PROGRESS, "in_review": TaskStatus.IN_REVIEW,
+                    "blocked": TaskStatus.BLOCKED, "ready": TaskStatus.READY,
+                    "backlog": TaskStatus.BACKLOG,
+                }
+                task.status = status_map.get(persisted_status, TaskStatus.BACKLOG)
+                orch.add_task(task)
+            except KeyError as e:
+                print(f"  ⚠ Skipping task file with missing field {e}: {task_file.name}")
+                continue
 
     mode_str = "CONTINUOUS" if config.continuous else ("UNTIL SCORE ≥ " + str(config.until_score) if config.until_score else "STANDARD")
     print(f"\n⚡ Starting forge run — {mode_str} — budget: ${config.budget:.2f}")
@@ -291,9 +304,9 @@ def cmd_health(args):
 
     print(f"\n⚡ Project Health\n{'━' * 40}")
     print(f"  Score:      {health['score']}/100  {health['readiness']}")
-    print(f"  Tests:      {health.get('test_coverage_proxy', '?')}")
-    print(f"  TODOs:      {health.get('todo_count', 0)}")
-    print(f"  Lint issues:{health.get('lint_issues', 0)}")
+    print(f"  Tests:      {health.get('test_score', '?')} (ratio: {health.get('test_file_ratio', '?')})")
+    print(f"  TODOs:      {health.get('todos', 0)} ({health.get('fixmes', 0)} FIXMEs, {health.get('hacks', 0)} HACKs)")
+    print(f"  Lint files: {health.get('lint_files_with_errors', 0)} with errors")
     print(f"  Security:   {health.get('security_issues', 0)} issues")
     print(f"  README:     {'✅' if health.get('has_readme') else '❌'}")
 
@@ -301,7 +314,7 @@ def cmd_health(args):
     history_file = forge_dir / "memory" / "health_history.json"
     if history_file.exists():
         try:
-            history = json.loads(history_file.read_text())
+            history = json.loads(history_file.read_text(encoding="utf-8", errors="replace"))
             if len(history) >= 2:
                 prev = history[-2]["score"]
                 curr = health["score"]
@@ -361,12 +374,18 @@ def cmd_status(args):
     tasks_dir = forge_dir / "tasks"
     if tasks_dir.exists():
         for task_file in sorted(tasks_dir.glob("*.json")):
-            data = json.loads(task_file.read_text())
+            try:
+                data = json.loads(task_file.read_text(encoding="utf-8", errors="replace"))
+            except (json.JSONDecodeError, ValueError):
+                print(f"  ⚠ Corrupted: {task_file.name}")
+                continue
             status = data.get("status", "backlog")
             icon = {"done": "✅", "in_progress": "🔄", "failed": "❌", "blocked": "⏳"}.get(status, "📋")
             provider = data.get("assigned_provider", "—")
             cost = data.get("actual_cost_usd", 0)
-            print(f"  {icon} {data['id']:<25} {data['type']:<12} {status:<12} {provider:<12} ${cost:.2f}")
+            task_id = data.get("id", task_file.stem)
+            task_type = data.get("type", "?")
+            print(f"  {icon} {task_id:<25} {task_type:<12} {status:<12} {provider:<12} ${cost:.2f}")
 
     # Show active locks
     locks_dir = forge_dir / "locks"
@@ -375,13 +394,16 @@ def cmd_status(args):
         if locks:
             print(f"\n🔒 Active locks: {len(locks)}")
             for lock in locks:
-                print(f"  {lock.stem}: {lock.read_text()[:50]}")
+                print(f"  {lock.stem}: {lock.read_text(encoding='utf-8', errors='replace')[:50]}")
 
     # Show budget
     budget_file = forge_dir / "budget" / "spending.json"
     if budget_file.exists():
-        budget = json.loads(budget_file.read_text())
-        print(f"\n💰 Budget: ${budget.get('budget_spent', 0):.2f} / ${budget.get('budget_total', 0):.2f}")
+        try:
+            budget = json.loads(budget_file.read_text(encoding="utf-8", errors="replace"))
+            print(f"\n💰 Budget: ${budget.get('budget_spent', 0):.2f} / ${budget.get('budget_total', 0):.2f}")
+        except (json.JSONDecodeError, ValueError):
+            print("\n⚠ Budget file is corrupted.")
 
 
 def cmd_providers(args):
@@ -418,14 +440,21 @@ def cmd_cost(args):
         print("No budget data. Run 'forge init' first.")
         return
 
-    data = json.loads(budget_file.read_text())
+    try:
+        data = json.loads(budget_file.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        print("⚠ Budget file is corrupted.")
+        return
     print(f"💰 Budget: ${data.get('budget_spent', 0):.2f} / ${data.get('budget_total', 0):.2f}")
 
     summary_file = Path.cwd() / FORGE_DIR / "budget" / "run_summary.json"
     if summary_file.exists():
-        summary = json.loads(summary_file.read_text())
-        print(f"   Tasks completed: {summary.get('completed', 0)}")
-        print(f"   Tasks failed: {summary.get('failed', 0)}")
+        try:
+            summary = json.loads(summary_file.read_text(encoding="utf-8", errors="replace"))
+            print(f"   Tasks completed: {summary.get('completed', 0)}")
+            print(f"   Tasks failed: {summary.get('failed', 0)}")
+        except (json.JSONDecodeError, ValueError):
+            print("   ⚠ Run summary file is corrupted.")
 
 
 def cmd_new(args):
@@ -434,13 +463,22 @@ def cmd_new(args):
         print("Usage: forge new <project-name> [--template python|node|react]")
         return
 
-    project_name = args[0]
+    # Sanitize project name to prevent path traversal and format-string injection
+    project_name = args[0].replace("{", "").replace("}", "").replace("..", "").replace("/", "").replace("\\", "").strip()
+    if not project_name or project_name.startswith("."):
+        print(f"❌ Invalid project name: '{args[0]}'")
+        return
+
     template = "python"  # default
     for i, a in enumerate(args):
         if a == "--template" and i + 1 < len(args):
             template = args[i + 1]
 
-    project_dir = Path.cwd() / project_name
+    project_dir = (Path.cwd() / project_name).resolve()
+    # Ensure the resolved path is still under cwd (prevents traversal)
+    if not str(project_dir).startswith(str(Path.cwd().resolve())):
+        print(f"❌ Invalid project path.")
+        return
 
     if project_dir.exists():
         print(f"❌ Directory '{project_name}' already exists.")
@@ -450,7 +488,7 @@ def cmd_new(args):
     project_dir.mkdir(parents=True)
 
     # --- Git init ---
-    subprocess.run(["git", "init", "--quiet"], cwd=project_dir)
+    subprocess.run(["git", "init", "--quiet"], cwd=project_dir, capture_output=True)
 
     # --- Template files based on project type ---
     templates = {
@@ -479,7 +517,7 @@ def cmd_new(args):
     for filepath, content in tmpl.items():
         full_path = project_dir / filepath
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content.format(name=project_name))
+        full_path.write_text(content.format(name=project_name), encoding="utf-8")
 
     # --- Universal instruction files (every provider reads one of these) ---
     instructions = f"""# {project_name}
@@ -504,7 +542,7 @@ def cmd_new(args):
 {"python src/main.py" if template == "python" else "npm start"}
 """
     for filename in ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]:
-        (project_dir / filename).write_text(instructions)
+        (project_dir / filename).write_text(instructions, encoding="utf-8")
 
     # --- forge.yaml config ---
     (project_dir / "forge.yaml").write_text("""# AgentForge Config
@@ -524,14 +562,16 @@ escalation:
   - aider        # API costs
   - claude       # Sonnet
   - claude-opus  # Nuclear option
-""")
+""", encoding="utf-8")
 
     # --- Initialize .forge/ ---
     import os
     original_dir = os.getcwd()
     os.chdir(project_dir)
-    cmd_init([])
-    os.chdir(original_dir)
+    try:
+        cmd_init([])
+    finally:
+        os.chdir(original_dir)
 
     # --- Initial commit ---
     subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
@@ -558,8 +598,11 @@ def cmd_events(args):
         print("No events yet. Run 'forge run' first.")
         return
 
-    lines = log_file.read_text().strip().split("\n")
-    count = int(args[0]) if args else 20
+    lines = log_file.read_text(encoding="utf-8", errors="replace").strip().split("\n")
+    try:
+        count = int(args[0]) if args else 20
+    except (ValueError, TypeError):
+        count = 20
     recent = lines[-count:]
 
     print(f"⚡ Recent Events (last {len(recent)})\n{'━' * 60}")
@@ -596,7 +639,7 @@ def cmd_watch(args):
                 try:
                     size = log_file.stat().st_size
                     if size > pos:
-                        with open(log_file, "r", errors="replace") as f:
+                        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
                             f.seek(pos)
                             new_content = f.read()
                             if new_content.strip():
@@ -624,9 +667,13 @@ def cmd_dag(args):
     graph = DependencyGraph()
     tasks = {}
     for task_file in sorted(tasks_dir.glob("*.json")):
-        data = json.loads(task_file.read_text())
-        tasks[data["id"]] = data
-        graph.add_task(data["id"], data.get("depends_on", []))
+        try:
+            data = json.loads(task_file.read_text(encoding="utf-8", errors="replace"))
+            tasks[data["id"]] = data
+            graph.add_task(data["id"], data.get("depends_on", []))
+        except (json.JSONDecodeError, ValueError, KeyError):
+            print(f"  ⚠ Skipping corrupted: {task_file.name}")
+            continue
 
     try:
         order = graph.topological_sort()
@@ -653,6 +700,24 @@ def cmd_dag(args):
         pass
 
 
+def cmd_dashboard(args):
+    """Launch the web dashboard."""
+    import importlib.util
+    dashboard_path = Path(__file__).parent / "dashboard.py"
+    if not dashboard_path.exists():
+        print("Dashboard not found. Expected at: dashboard.py")
+        return
+    # Check .forge dir exists
+    forge_dir = Path.cwd() / FORGE_DIR
+    if not forge_dir.exists():
+        print("No .forge directory found. Run 'forge init' first.")
+        return
+    print("Starting dashboard at http://localhost:8420 ...")
+    spec = importlib.util.spec_from_file_location("dashboard", str(dashboard_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+
 def cmd_help(args):
     print_banner()
     print("Commands:")
@@ -668,6 +733,7 @@ def cmd_help(args):
     print("  watch                      Live tail of agent logs")
     print("  providers                  List available AI providers")
     print("  cost                       Spending breakdown")
+    print("  dashboard                  Launch web dashboard (localhost:8420)")
     print()
     print("Run flags:")
     print("  --budget N                 Max spend in USD (default: 10)")
@@ -709,6 +775,7 @@ def cli():
         "watch": cmd_watch,
         "providers": cmd_providers,
         "cost": cmd_cost,
+        "dashboard": cmd_dashboard,
         "help": cmd_help,
         "-h": cmd_help,
         "--help": cmd_help,

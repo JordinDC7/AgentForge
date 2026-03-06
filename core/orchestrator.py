@@ -34,6 +34,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import yaml
@@ -42,6 +43,51 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+def _kill_process_tree(proc):
+    """Kill a process and all its children. On Windows, shell=True creates
+    an intermediate cmd.exe — proc.kill() only kills cmd.exe, orphaning the
+    real agent. Use taskkill /T to kill the entire process tree."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def _atomic_write(path: Path, content: str):
+    """Write content to file atomically via temp file + rename.
+
+    Prevents file corruption if the process crashes mid-write.
+    On Windows, os.replace() is atomic within the same volume.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        # On Windows, os.replace() fails if target is open by another process
+        # (antivirus, file indexer, etc.) — retry with exponential backoff
+        for _attempt in range(10):
+            try:
+                os.replace(tmp, str(path))
+                break
+            except PermissionError:
+                if sys.platform != "win32" or _attempt == 9:
+                    raise
+                time.sleep(0.1 * (2 ** min(_attempt, 4)))  # 0.1s → 1.6s
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 from core.cost_router import CostRouter, TaskComplexity
 from core.dag import DependencyGraph, CycleError
@@ -125,6 +171,10 @@ class Orchestrator:
         self._tasks_completed_since_discovery = 0
         self._running = True
         self._style_guide: str = ""  # Cached project style guide
+        self._consecutive_failures = 0  # Track failures to throttle when things go wrong
+
+        # Lock for git operations (merge, checkout) to prevent concurrent corruption
+        self._git_lock = threading.Lock()
 
         # DAG for dependency tracking
         self._dag = DependencyGraph()
@@ -135,6 +185,7 @@ class Orchestrator:
         # Context watcher — tracks SHARED.md hash to detect mid-run changes
         self._shared_md_hash: str = ""
         self._context_watcher_running = False
+        self._context_watcher_stop = threading.Event()
 
         # Dynamic provider accuracy (updated from memory)
         self._dynamic_accuracy: dict[str, float] = {}
@@ -229,8 +280,14 @@ class Orchestrator:
         self._log(f"⚡ FORGE RUN — Mode: {mode} | Budget: ${self.config.budget:.2f}")
         if self.config.provider_override:
             self._log(f"   Provider override: ALL tasks → {self.config.provider_override}")
+            if not any(p.name == self.config.provider_override for p in self.providers):
+                self._log(f"   ⚠ WARNING: Provider '{self.config.provider_override}' not found! Available: {', '.join(p.name for p in self.providers)}")
         if self.config.routing_overrides:
             self._log(f"   Routing overrides: {self.config.routing_overrides}")
+            provider_names = {p.name for p in self.providers}
+            for task_type, pname in self.config.routing_overrides.items():
+                if pname not in provider_names:
+                    self._log(f"   ⚠ WARNING: Override '{task_type} → {pname}' — provider '{pname}' not found! Available: {', '.join(sorted(provider_names))}")
         if self.config.goal:
             self._log(f"   Goal: {self.config.goal}")
         self._log(f"   Tasks loaded: {len(self.tasks)}")
@@ -291,6 +348,7 @@ class Orchestrator:
         self._last_discovery_time = time.time()
         while self._running and iteration < max_iter:
             iteration += 1
+            self._current_iteration = iteration
 
             # ── Budget check ──
             remaining = self.config.budget - self.budget_spent
@@ -312,8 +370,9 @@ class Orchestrator:
             # ── Score check (until-score mode) ──
             if self.config.until_score is not None:
                 health = self.discovery.get_project_health()
-                score = health["score"]
-                self._log(f"\n📊 Health score: {score}/100 {health['readiness']} (target: {self.config.until_score})")
+                score = health.get("score", 0)
+                readiness = health.get("readiness", "unknown")
+                self._log(f"\n📊 Health score: {score}/100 {readiness} (target: {self.config.until_score})")
                 if score >= self.config.until_score:
                     self._log(f"\n🎯 TARGET SCORE REACHED! {score} ≥ {self.config.until_score}")
                     break
@@ -334,7 +393,11 @@ class Orchestrator:
                     if self.config.continuous or self.config.until_score is not None:
                         # Continuous/until-score: keep looping, re-discover periodically
                         self._log("   Continuous mode — sleeping then re-discovering...")
-                        time.sleep(self.config.poll_interval * 6)  # ~60s pause before re-scan
+                        # Interruptible sleep so Ctrl+C is responsive
+                        for _ in range(self.config.poll_interval * 6):
+                            if not self._running:
+                                break
+                            time.sleep(1)
                         continue
                     self._log("\n✅ ALL TASKS COMPLETE")
                     break
@@ -343,6 +406,7 @@ class Orchestrator:
                     self._inject_test_first_tasks()
                 self._inject_review_tasks()
                 self._rebuild_dag()
+                self._update_task_statuses()  # Promote new tasks so they're dispatchable this iteration
 
             # ── Discovery cycle (every N completed tasks OR every 5 min in continuous) ──
             time_since_discovery = time.time() - self._last_discovery_time
@@ -361,6 +425,12 @@ class Orchestrator:
                 self._inject_docs_task()
                 # Rebuild DAG with new tasks
                 self._rebuild_dag()
+                self._update_task_statuses()  # Promote new tasks immediately
+
+            # ── Monitor active agents BEFORE dispatch to update budget/status ──
+            # This ensures budget_spent is current before we decide to dispatch more
+            self._monitor_active_agents()
+            self._sync_budget()
 
             # ── Find and dispatch ready tasks (parallel, DAG-aware) ──
             # Use DAG to find tasks whose dependencies are all met
@@ -383,10 +453,24 @@ class Orchestrator:
                 ready.sort(key=lambda t: t.priority, reverse=True)
                 # Limit concurrent agents to avoid rate limits
                 in_flight = len(self._active_processes)
-                slots = self.config.max_concurrent - in_flight
+                slots = max(0, max(1, self.config.max_concurrent) - in_flight)
+                if slots <= 0:
+                    pass  # All slots occupied — skip dispatch, monitor will free them
+
+                # Health-aware throttling: reduce concurrency when agents keep failing
+                if self._consecutive_failures >= 3:
+                    slots = min(slots, 1)  # Serial mode — one at a time until a success
+                    if self._consecutive_failures >= 3 and not getattr(self, '_failure_warned', False):
+                        self._failure_warned = True
+                        self._log(f"  🔴 {self._consecutive_failures} consecutive failures — throttling to 1 agent at a time")
 
                 # Filter to tasks that don't conflict with each other (file overlap check)
                 dispatchable = self._select_non_conflicting(ready[:slots * 2], slots)
+
+                # If all tasks conflict with in-progress work, force dispatch highest-priority
+                if not dispatchable and ready and slots > 0:
+                    self._log(f"  ⚠ All {len(ready)} ready tasks conflict with in-progress work — forcing highest-priority")
+                    dispatchable = [ready[0]]
 
                 for task in dispatchable:
                     if self.config.budget - self.budget_spent <= 0:
@@ -410,23 +494,32 @@ class Orchestrator:
                         if ready_but_not_dag:
                             self._log(f"     {len(ready_but_not_dag)} READY but not DAG-ready (deps not met in DAG)")
                 if in_progress:
-                    self._monitor_active_agents()
-                    self._sync_budget()
                     time.sleep(self.config.poll_interval)
                     continue
                 else:
-                    # Check for deadlocks
+                    # Check for deadlocks — only clear orphan locks (process dead but lock exists)
                     blocked = [t for t in self.tasks if t.status == TaskStatus.BLOCKED]
                     if blocked:
-                        self._log(f"⚠ {len(blocked)} blocked tasks. Breaking deadlock.")
-                        self._set_status(blocked[0], TaskStatus.READY)
+                        resolved = False
+                        for bt in blocked:
+                            lock_file = self.forge_dir / "locks" / f"{bt.id}.lock"
+                            if lock_file.exists() and bt.id not in self._active_processes:
+                                # Lock exists but no subprocess — the process died
+                                lock_file.unlink(missing_ok=True)
+                                self._set_status(bt, TaskStatus.READY)
+                                self._log(f"  🔓 Cleared orphan lock for {bt.id}")
+                                resolved = True
+                                break
+                            elif not lock_file.exists():
+                                self._set_status(bt, TaskStatus.READY)
+                                resolved = True
+                                break
+                        if not resolved:
+                            self._log(f"  ⚠ {len(blocked)} blocked tasks — locks held by active processes")
                     # MUST sleep to avoid CPU spin when no tasks are actionable
                     # (e.g., all tasks BACKLOG with unmet deps, or waiting for discovery)
                     time.sleep(self.config.poll_interval)
                     continue
-
-            self._monitor_active_agents()
-            self._sync_budget()
 
             # ── Heartbeat: periodic status line so user knows we're alive ──
             now = time.time()
@@ -437,8 +530,29 @@ class Orchestrator:
 
             time.sleep(self.config.poll_interval)
 
-        # Stop context watcher
+        # Stop context watcher (signal immediately instead of waiting up to 15s)
         self._context_watcher_running = False
+        self._context_watcher_stop.set()
+
+        # Terminate any still-running agent processes to prevent zombies
+        for task_id, proc in list(self._active_processes.items()):
+            try:
+                if proc.poll() is None:
+                    self._log(f"  🛑 Terminating running agent: {task_id}")
+                    _kill_process_tree(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass  # taskkill /T already sent
+            except Exception:
+                pass
+        self._active_processes.clear()
+
+        # Clean up lock files for terminated processes
+        locks_dir = self.forge_dir / "locks"
+        if locks_dir.exists():
+            for lock_file in locks_dir.glob("*.lock"):
+                lock_file.unlink(missing_ok=True)
 
         # Final checkpoint
         self._save_checkpoint()
@@ -461,32 +575,75 @@ class Orchestrator:
 
         Uses both filesystem-based discovery AND LLM-assisted planning.
         """
+        # Prune completed/failed tasks to prevent unbounded list growth in continuous mode
+        if len(self.tasks) > 200:
+            active = [t for t in self.tasks if t.status not in (TaskStatus.DONE, TaskStatus.FAILED)]
+            finished = [t for t in self.tasks if t.status in (TaskStatus.DONE, TaskStatus.FAILED)]
+            # Keep the 100 most recent finished tasks (they're already persisted to disk)
+            self.tasks = active + finished[-100:]
+
+        # Don't flood the queue — cap total pending work before discovering more
+        pending = [t for t in self.tasks if t.status in (TaskStatus.READY, TaskStatus.BACKLOG, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED)]
+        if len(pending) >= 15:
+            self._log(f"  📡 Skipping discovery — {len(pending)} tasks already pending (cap: 15)")
+            return 0
+
         discovered = self.discovery.discover_all(self.config.goal)
         new_count = 0
 
         # Build set of existing task titles for deduplication
-        existing_titles = {t.title.strip().lower() for t in self.tasks}
-        # Also deduplicate by first 60 chars (catches minor rewording)
-        existing_prefixes = {t.title.strip().lower()[:60] for t in self.tasks}
+        existing_titles = set()
+        existing_prefixes = set()
+        for t in self.tasks:
+            tl = t.title.strip().lower()
+            nl = self.discovery._normalize_title(tl)
+            existing_titles.add(tl)
+            existing_titles.add(nl)
+            existing_prefixes.add(tl[:60])
+            existing_prefixes.add(nl[:60])
 
-        for work in discovered[:10]:  # Cap per cycle
+        # How many slots are available for new tasks (total pending cap = 15)
+        max_new = max(1, 15 - len(pending))
+        # Track Design task IDs so Implement tasks can depend on them
+        design_task_ids = {}  # feature_name -> task_id
+        for work in discovered[:min(5, max_new)]:  # Cap per cycle: 5 (was 10)
             title_lower = work.title.strip().lower()
+            normalized = self.discovery._normalize_title(title_lower)
             # Skip if we already have a task with this title (or very similar)
             if title_lower in existing_titles or title_lower[:60] in existing_prefixes:
                 continue
+            if normalized in existing_titles or normalized[:60] in existing_prefixes:
+                continue
+            # Substring match: skip if core of this title already exists
+            core = normalized[:40]
+            if len(core) >= 10 and any(core in et for et in existing_titles if len(et) > 10):
+                continue
             task_id = f"disc-{int(time.time())}-{new_count}"
+            # Wire up Design -> Implement dependencies
+            deps = []
+            if title_lower.startswith("implement:"):
+                feature = title_lower.split(":", 1)[1].strip()
+                if feature in design_task_ids:
+                    deps = [design_task_ids[feature]]
             task = Task(
                 id=task_id,
                 type=work.task_type,
                 title=work.title,
                 description=work.description,
                 priority=work.priority,
+                depends_on=deps,
                 source="discovery",
             )
             self.tasks.append(task)
             self._save_task(task)
+            # Track Design tasks for dependency wiring
+            if title_lower.startswith("design:"):
+                feature = title_lower.split(":", 1)[1].strip()
+                design_task_ids[feature] = task_id
             existing_titles.add(title_lower)
+            existing_titles.add(normalized)
             existing_prefixes.add(title_lower[:60])
+            existing_prefixes.add(normalized[:60])
             new_count += 1
 
         # LLM-assisted planning for the goal (only on first discovery with a goal)
@@ -538,7 +695,7 @@ class Orchestrator:
             except json.JSONDecodeError:
                 pass
         history.append({"timestamp": datetime.now().isoformat(), **health})
-        memory_file.write_text(json.dumps(history[-50:], indent=2), encoding="utf-8")  # Keep last 50
+        _atomic_write(memory_file, json.dumps(history[-50:], indent=2))  # Keep last 50
 
         return new_count
 
@@ -719,7 +876,9 @@ class Orchestrator:
                       and t.status in (TaskStatus.READY, TaskStatus.BACKLOG)]
         existing_tests = {t.title for t in self.tasks if t.type == "testing"}
 
-        for impl_task in impl_tasks:
+        # Cap: only create test tasks for the highest-priority impl tasks
+        created = 0
+        for impl_task in impl_tasks[:5]:
             test_title = f"Tests: {impl_task.title[:60]}"
             if test_title in existing_tests:
                 continue
@@ -750,6 +909,7 @@ class Orchestrator:
                 source="test-first",
             )
             self.add_task(test_task)
+            created += 1
 
             # Make the implementation task depend on the test task
             if test_task.id not in impl_task.depends_on:
@@ -767,8 +927,8 @@ class Orchestrator:
                 )
                 self._save_task(impl_task)
 
-        if impl_tasks:
-            self._log(f"  🧪 Test-first: created test tasks for {len(impl_tasks)} implementation tasks")
+        if created:
+            self._log(f"  🧪 Test-first: created {created} test tasks (of {len(impl_tasks)} impl tasks, cap: 5)")
 
     def _extract_style_guide(self) -> str:
         """Scan the existing codebase and extract coding patterns.
@@ -786,10 +946,26 @@ class Orchestrator:
 
         patterns = []
 
-        # Detect language and framework
-        project_files = list(self.project_dir.rglob("*"))
-        py_files = [f for f in project_files if f.suffix == ".py" and ".forge" not in str(f) and "venv" not in str(f)]
-        js_files = [f for f in project_files if f.suffix in (".js", ".ts", ".jsx", ".tsx") and "node_modules" not in str(f)]
+        # Detect language and framework — use targeted globs, not rglob("*")
+        # which can hang on large repos with node_modules/venv
+        skip_dirs = {".forge", "venv", ".venv", "node_modules", "__pycache__", ".git", "dist", "build"}
+
+        def _safe_rglob(ext: str, limit: int = 20) -> list[Path]:
+            """rglob with early termination and directory filtering."""
+            results = []
+            try:
+                for f in self.project_dir.rglob(f"*{ext}"):
+                    if any(part in skip_dirs for part in f.parts):
+                        continue
+                    results.append(f)
+                    if len(results) >= limit:
+                        break
+            except (PermissionError, OSError):
+                pass
+            return results
+
+        py_files = _safe_rglob(".py")
+        js_files = _safe_rglob(".js") + _safe_rglob(".ts") + _safe_rglob(".tsx") + _safe_rglob(".jsx")
 
         if py_files:
             patterns.append("Language: Python")
@@ -888,7 +1064,10 @@ class Orchestrator:
                 lock_data = json.loads(lock_file.read_text(encoding="utf-8", errors="replace"))
                 started = lock_data.get("started", "")
                 if started:
-                    lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                    try:
+                        lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                    except (ValueError, TypeError):
+                        lock_age = float("inf")  # Corrupt timestamp — treat as stale
                     if lock_age > self.config.timeout_minutes * 60:
                         lock_file.unlink()
                         cleaned += 1
@@ -896,8 +1075,13 @@ class Orchestrator:
                     lock_file.unlink()
                     cleaned += 1
             except Exception:
-                lock_file.unlink()
-                cleaned += 1
+                try:
+                    lock_file.unlink()
+                    cleaned += 1
+                except PermissionError:
+                    self._log(f"  ⚠ Cannot remove lock {lock_file.name} (file in use)")
+                except OSError:
+                    cleaned += 1  # Already gone
         if cleaned:
             self._log(f"  🔓 Cleaned {cleaned} stale lock(s) from previous run")
 
@@ -923,7 +1107,10 @@ class Orchestrator:
                         lock_data = json.loads(lock_file.read_text(encoding="utf-8", errors="replace"))
                         started = lock_data.get("started", "")
                         if started:
-                            lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                            try:
+                                lock_age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                            except (ValueError, TypeError):
+                                lock_age = float("inf")
                             if lock_age > self.config.timeout_minutes * 60:
                                 should_reset = True
                             else:
@@ -934,7 +1121,11 @@ class Orchestrator:
                     except Exception:
                         should_reset = True  # Corrupt lock file
                 if should_reset:
-                    lock_file.unlink(missing_ok=True)
+                    try:
+                        lock_file.unlink(missing_ok=True)
+                    except PermissionError:
+                        self._log(f"  ⚠ Cannot remove lock for {task.id} (file in use) — skipping reset")
+                        continue
                     self._set_status(task, TaskStatus.READY)
                     reset_count += 1
         if reset_count:
@@ -946,17 +1137,23 @@ class Orchestrator:
         for t in self.tasks:
             counts[t.status.value] = counts.get(t.status.value, 0) + 1
         active = []
-        for tid, proc in self._active_processes.items():
+        for tid, proc in list(self._active_processes.items()):
             task = next((t for t in self.tasks if t.id == tid), None)
             if task:
                 elapsed = 0
                 if task.started_at:
-                    elapsed = (datetime.now() - datetime.fromisoformat(task.started_at)).total_seconds()
-                active.append(f"{task.id[:25]}({task.assigned_provider},{int(elapsed)}s)")
+                    try:
+                        elapsed = (datetime.now() - datetime.fromisoformat(task.started_at)).total_seconds()
+                    except (ValueError, TypeError):
+                        elapsed = 0
+                active.append(f"{task.id}({task.assigned_provider},{int(elapsed)}s)")
+        done = counts.get("done", 0)
+        total = len(self.tasks)
+        progress = f"{done}/{total}" if total > 0 else "0/0"
         parts = [f"{k}:{v}" for k, v in sorted(counts.items())]
         status_str = " ".join(parts)
         active_str = ", ".join(active) if active else "none"
-        self._log(f"  💓 [{status_str}] | running: {active_str} | spent: ${self.budget_spent:.2f}")
+        self._log(f"  💓 [{progress} complete] [{status_str}] | running: {active_str} | spent: ${self.budget_spent:.2f}")
 
     def _set_status(self, task: Task, status: TaskStatus):
         """Change task status and sync to disk so dashboard can see it."""
@@ -1000,7 +1197,12 @@ class Orchestrator:
                 # Unblock tasks whose lock has been cleared
                 lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
                 if not lock_file.exists():
-                    self._set_status(task, TaskStatus.READY)
+                    # Check deps before moving to READY — task may have been blocked
+                    # by a lock but also has unmet dependencies
+                    if task.depends_on and not all(dep in done_ids for dep in task.depends_on):
+                        self._set_status(task, TaskStatus.BACKLOG)  # Re-enter dep check
+                    else:
+                        self._set_status(task, TaskStatus.READY)
         if promoted > 0:
             self._log(f"  📋 Promoted {promoted} tasks BACKLOG → READY")
         if backlog_stuck > 0 and promoted == 0:
@@ -1064,12 +1266,19 @@ class Orchestrator:
         if not mail_dir.exists():
             return
 
-        # Find the most recent review mail (likely from this review)
-        recent = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-        if not recent:
-            return
-
-        review_output = recent[0].read_text(encoding="utf-8", errors="replace")
+        # Find the review mail for THIS specific review task (not just the most recent)
+        review_output = None
+        # First try to find a file named after this review task
+        for candidate in mail_dir.glob("*.md"):
+            if review_task.id in candidate.name:
+                review_output = candidate.read_text(encoding="utf-8", errors="replace")
+                break
+        # Fall back to most recent file if no task-specific file found
+        if review_output is None:
+            recent = sorted(mail_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not recent:
+                return
+            review_output = recent[0].read_text(encoding="utf-8", errors="replace")
 
         # Count severity tags to decide if we need a fix task
         critical = review_output.lower().count("[critical]")
@@ -1081,6 +1290,11 @@ class Orchestrator:
         # Extract the original task ID from the review task
         original_id = review_task.id.replace("review-", "", 1)
         fix_id = f"fix-{original_id}"
+
+        # Prevent infinite fix→review→fix chains (cap at depth 2)
+        if fix_id.count("fix-") >= 2:
+            self._log(f"  ⏭ Skipping fix task — already at review depth 2")
+            return
 
         if any(t.id == fix_id for t in self.tasks):
             return  # Already have a fix task
@@ -1154,8 +1368,10 @@ class Orchestrator:
                 failure_history=failure_history,
             )
         except RuntimeError as e:
-            self._log(f"  ❌ No provider: {e}")
-            self._set_status(task, TaskStatus.FAILED)
+            self._log(f"  ⚠ No provider available: {e} — task stays READY for retry")
+            # Don't permanently fail — leave as READY so next iteration can retry
+            # after poll_interval (giving providers time to recover from transient issues)
+            self._consecutive_failures += 1
             return
 
         source_label = "override" if preferred else "auto-routed"
@@ -1174,14 +1390,31 @@ class Orchestrator:
             self._log(f"  ⚠ {conflict_warning}")
 
         task.branch = branch
+
+        # Pre-create the branch so agents don't accidentally commit to main
+        try:
+            subprocess.run(
+                ["git", "branch", branch],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass  # Non-fatal — agent can still create it
         task.assigned_provider = decision.provider.name
         self._set_status(task, TaskStatus.IN_PROGRESS)
         task.started_at = datetime.now().isoformat()
 
-        # Lock
+        # Lock — atomic create to prevent TOCTOU double-dispatch
         lock_file = self.forge_dir / "locks" / f"{task.id}.lock"
         lock_file.parent.mkdir(parents=True, exist_ok=True)
-        lock_file.write_text(json.dumps({"agent": decision.provider.name, "started": task.started_at}), encoding="utf-8")
+        lock_data = json.dumps({"agent": decision.provider.name, "started": task.started_at})
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(lock_data)
+        except FileExistsError:
+            self._log(f"  ⚠ Lock already exists for {task.id} — aborting dispatch")
+            self._set_status(task, TaskStatus.BLOCKED)
+            return
 
         # Build prompt with role instructions
         role_instructions = self._load_role_instructions(task.type)
@@ -1202,7 +1435,7 @@ class Orchestrator:
         )
 
         # Calculate per-task cost cap: min of configured cap and remaining budget
-        remaining_budget = self.config.budget - self.budget_spent
+        remaining_budget = max(0.01, self.config.budget - self.budget_spent)
         task_cost_cap = min(self.config.max_cost_per_task, remaining_budget)
 
         # Smart effort scaling — based on actual task complexity, not just type
@@ -1229,6 +1462,9 @@ class Orchestrator:
                 shell=(sys.platform == "win32"),
             )
 
+            # Track immediately to prevent orphaned processes if code below raises
+            self._active_processes[task.id] = proc
+
             def _capture_output(process, filepath):
                 """Read from process stdout line-by-line and write to file in real-time."""
                 try:
@@ -1242,8 +1478,6 @@ class Orchestrator:
 
             t = threading.Thread(target=_capture_output, args=(proc, log_file), daemon=True)
             t.start()
-
-            self._active_processes[task.id] = proc
             self._log(f"  ✅ Spawned (PID: {proc.pid})")
             self.events.emit(Event(type=EventType.TASK_STARTED, data={
                 "task_id": task.id, "title": task.title, "type": task.type,
@@ -1251,6 +1485,11 @@ class Orchestrator:
             }))
         except Exception as e:
             self._log(f"  ❌ Spawn failed: {e}")
+            # Clean up lock file so the task isn't permanently locked
+            try:
+                lock_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             self._set_status(task, TaskStatus.FAILED)
             self.events.emit(Event(type=EventType.TASK_FAILED, data={
                 "task_id": task.id, "title": task.title, "error": str(e),
@@ -1260,28 +1499,28 @@ class Orchestrator:
         completed = []
 
         # Flush all active log handles so dashboard sees live output
-        for task_id, handle in self._active_log_handles.items():
+        for task_id, handle in list(self._active_log_handles.items()):
             try:
                 handle.flush()
             except Exception:
                 pass
 
-        for task_id, proc in self._active_processes.items():
+        for task_id, proc in list(self._active_processes.items()):
             ret = proc.poll()
             if ret is None:
                 # Check timeout — kill runaway agents
                 task = next((t for t in self.tasks if t.id == task_id), None)
                 if task and task.started_at:
-                    start = datetime.fromisoformat(task.started_at)
-                    elapsed = (datetime.now() - start).total_seconds()
+                    try:
+                        start = datetime.fromisoformat(task.started_at)
+                        elapsed = (datetime.now() - start).total_seconds()
+                    except (ValueError, TypeError):
+                        elapsed = 0
                     provider = next((p for p in self.providers if p.name == task.assigned_provider), None)
                     timeout_secs = (provider.config.timeout_minutes if provider else 30) * 60
                     if elapsed > timeout_secs:
                         self._log(f"  ⏰ {task_id} TIMED OUT after {elapsed/60:.0f}min (limit: {timeout_secs/60:.0f}min) — killing")
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
+                        _kill_process_tree(proc)
                         # Don't continue — let the next poll() pick up the exit code
                 continue
 
@@ -1301,14 +1540,18 @@ class Orchestrator:
 
             duration = 0.0
             if task.started_at:
-                start = datetime.fromisoformat(task.started_at)
-                duration = (datetime.now() - start).total_seconds()
+                try:
+                    start = datetime.fromisoformat(task.started_at)
+                    duration = (datetime.now() - start).total_seconds()
+                except (ValueError, TypeError):
+                    duration = 0.0
 
             # Parse real cost from agent log output
             cost = self._parse_cost_from_log(task)
             cost_source = "tokens" if cost > 0 else "unknown"
             task.actual_cost_usd = cost
             self.budget_spent += cost
+            self.router.record_spend(cost)
 
             if ret == 0:
                 # ── Validation gate: verify the agent actually did something useful ──
@@ -1336,19 +1579,26 @@ class Orchestrator:
                             f"Fix the issues above and try again.\n"
                         )
                         self._set_status(task, TaskStatus.READY)
+                        task.complexity = TaskComplexity.HARD  # Escalate to more capable provider
+                        self._consecutive_failures += 1
                         self._save_to_memory(task, success=False)
                     else:
                         self._log(f"  ❌ {task_id} failed validation after {task.max_retries} attempts: {validation['reason']}")
-                        self._set_status(task, TaskStatus.DONE)  # Accept imperfect work
-                        task.completed_at = datetime.now().isoformat()
-                        self._tasks_completed_since_discovery += 1
-                        self._save_to_memory(task, success=True)
-                        self._write_completion_handoff(task, duration)
+                        self._set_status(task, TaskStatus.FAILED)
+                        self._consecutive_failures += 1
+                        self._save_to_memory(task, success=False)
+                        self.events.emit(Event(type=EventType.TASK_FAILED, data={
+                            "task_id": task.id, "title": task.title, "type": task.type,
+                            "provider": task.assigned_provider, "retries": task.retries,
+                            "message": f"Failed validation after {task.retries} retries: {validation['reason']}",
+                        }))
                 else:
                     self._set_status(task, TaskStatus.DONE)
                     task.completed_at = datetime.now().isoformat()
                     self._tasks_completed_since_discovery += 1
                     self._log(f"  ✅ {task_id} DONE (${cost:.4f} [{cost_source}], {duration:.0f}s, {task.assigned_provider})")
+                    self._consecutive_failures = 0  # Reset failure streak on success
+                    self._failure_warned = False
                     self._save_to_memory(task, success=True)
                     self._write_completion_handoff(task, duration)
                     self.events.emit(Event(type=EventType.TASK_COMPLETED, data={
@@ -1362,7 +1612,9 @@ class Orchestrator:
                     self._try_auto_merge(task)
 
                 # Auto-create review task — but skip for small/trivial changes
-                if task.status == TaskStatus.DONE and task.type not in ("review", "docs", "architecture") and task.source != "review":
+                # Also skip if this is a deeply nested fix task (prevent fix→review→fix→review chains)
+                fix_depth = task.id.count("fix-")
+                if task.status == TaskStatus.DONE and task.type not in ("review", "docs", "architecture") and task.source not in ("review", "review-fix") and fix_depth < 2:
                     if self._needs_review(task):
                         review_id = f"review-{task.id}"
                         if not any(t.id == review_id for t in self.tasks):
@@ -1411,6 +1663,7 @@ class Orchestrator:
                 else:
                     self._log(f"  ❌ {task_id} FAILED permanently after {task.max_retries} retries")
                     self._set_status(task, TaskStatus.FAILED)
+                    self._consecutive_failures += 1
                     self._save_to_memory(task, success=False)
                     self.events.emit(Event(type=EventType.TASK_FAILED, data={
                         "task_id": task.id, "title": task.title, "type": task.type,
@@ -1418,10 +1671,14 @@ class Orchestrator:
                         "message": f"{task.title} failed after {task.retries} retries",
                     }))
 
-            (self.forge_dir / "locks" / f"{task_id}.lock").unlink(missing_ok=True)
-            self._save_task(task)
-            self._sync_budget()
-            completed.append(task_id)
+            try:
+                (self.forge_dir / "locks" / f"{task_id}.lock").unlink(missing_ok=True)
+                self._save_task(task)
+                self._sync_budget()
+                completed.append(task_id)
+            except Exception as e:
+                self._log(f"  ⚠ Failed to finalize {task_id}: {e} — keeping in-flight to retry next cycle")
+                # Do NOT add to completed — task stays tracked in _active_processes
 
         for tid in completed:
             self._active_processes.pop(tid, None)
@@ -1551,10 +1808,14 @@ class Orchestrator:
         return {"passed": True}
 
     def _run_test_gate(self, task: Task) -> Optional[dict]:
-        """Run tests after agent completes. Returns None if no test runner found."""
+        """Run tests on the agent's branch to verify changes don't break anything.
+
+        Uses git stash + checkout to test the agent's actual branch, then
+        restores the original state. Protected by _git_lock.
+        """
         # Detect test runner
         runners = [
-            (self.project_dir / "package.json", ["npm", "test"]),
+            (self.project_dir / "package.json", ["cmd", "/c", "npm", "test"] if sys.platform == "win32" else ["npm", "test"]),
             (self.project_dir / "pytest.ini", ["pytest", "--tb=short", "-q"]),
             (self.project_dir / "pyproject.toml", ["pytest", "--tb=short", "-q"]),
             (self.project_dir / "setup.py", ["pytest", "--tb=short", "-q"]),
@@ -1569,28 +1830,65 @@ class Orchestrator:
         if not cmd:
             return None  # No test runner found — skip
 
-        # Checkout the task's branch so we test the right code
-        prev_branch = None
-        if task.branch:
-            try:
-                prev_branch = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
-                ).stdout.strip()
-                if prev_branch != task.branch:
-                    subprocess.run(
-                        ["git", "checkout", task.branch],
-                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
-                    )
-            except Exception:
-                pass
+        branch = task.branch
+        if not branch:
+            return None
 
+        # Acquire git lock to avoid conflicts with concurrent merges
+        if not self._git_lock.acquire(timeout=30):
+            self._log(f"  ⚠ Could not acquire git lock for test gate — skipping")
+            return None
+
+        stashed = False
+        original_branch = None
         try:
+            # Check for bad git state before mutations
+            git_issue = self._check_git_health()
+            if git_issue:
+                self._log(f"  ⚠ Skipping test gate: {git_issue}")
+                return None
+
+            # Save current branch
+            original_branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+
+            # Check if branch exists
+            branch_check = subprocess.run(
+                ["git", "rev-parse", "--verify", branch],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+            if branch_check.returncode != 0:
+                return None  # Branch doesn't exist
+
+            # Stash any dirty state with named message for identification
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+            if status.stdout.strip():
+                stash_result = subprocess.run(
+                    ["git", "stash", "push", "--include-untracked", "-m", f"forge-test-gate-{task.id}"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                stashed = stash_result.returncode == 0
+
+            # Checkout the agent's branch
+            checkout = subprocess.run(
+                ["git", "checkout", branch],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+            if checkout.returncode != 0:
+                self._log(f"  ⚠ Can't checkout {branch} for test gate — skipping")
+                return None
+
+            # Run tests on the agent's branch
             result = subprocess.run(
                 cmd, cwd=self.project_dir, capture_output=True, text=True, timeout=120,
             )
+
             if result.returncode != 0:
-                # Extract last 30 lines of test output
                 output = (result.stdout + result.stderr).strip()
                 last_lines = "\n".join(output.split("\n")[-30:])
                 return {
@@ -1598,20 +1896,39 @@ class Orchestrator:
                     "reason": "Tests failed after your changes",
                     "details": f"Test output:\n```\n{last_lines}\n```\nFix the failing tests before marking done.",
                 }
+
         except subprocess.TimeoutExpired:
             return {"passed": False, "reason": "Tests timed out (>2min)", "details": "Tests are hanging. Check for infinite loops."}
         except FileNotFoundError:
-            return None  # Test runner not installed — skip
+            return None  # Test runner not installed
+        except Exception as e:
+            self._log(f"  ⚠ Test gate error: {e}")
+            return None
         finally:
-            # Restore previous branch
-            if prev_branch and prev_branch != task.branch:
-                try:
-                    subprocess.run(
-                        ["git", "checkout", prev_branch],
+            # Always restore original branch and stash
+            checkout_ok = False
+            if original_branch and original_branch != "HEAD":
+                restore = subprocess.run(
+                    ["git", "checkout", original_branch],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                checkout_ok = restore.returncode == 0
+            if stashed:
+                if checkout_ok:
+                    pop = subprocess.run(
+                        ["git", "stash", "pop"],
                         cwd=self.project_dir, capture_output=True, text=True, timeout=10,
                     )
-                except Exception:
-                    pass
+                    if pop.returncode != 0:
+                        self._log(f"  ⚠ Stash pop failed (conflict?) — stash preserved in stash list")
+                else:
+                    # Can't restore to original branch — drop stash to avoid applying to wrong branch
+                    self._log(f"  ⚠ Could not restore branch — dropping stash to prevent contamination")
+                    subprocess.run(
+                        ["git", "stash", "drop"],
+                        cwd=self.project_dir, capture_output=True, timeout=10,
+                    )
+            self._git_lock.release()
 
         return {"passed": True}
 
@@ -1655,7 +1972,9 @@ class Orchestrator:
                 active_files = set(result.stdout.strip().split("\n"))
                 overlap = task_files & active_files
                 if overlap:
-                    # Inject warning into task description
+                    # Inject warning into task description (only once)
+                    if "## CONFLICT WARNING" in task.description:
+                        return f"File overlap with {active_task.branch}: {', '.join(sorted(overlap)[:3])}"
                     task.description += (
                         f"\n\n## CONFLICT WARNING\n"
                         f"Branch `{active_task.branch}` ({active_task.type}) is currently modifying "
@@ -1681,10 +2000,39 @@ class Orchestrator:
             files.add("README.md")
         return files
 
+    def _check_git_health(self) -> str | None:
+        """Check for bad git states that would cause operations to fail.
+        Returns error message if unhealthy, None if OK."""
+        git_dir = self.project_dir / ".git"
+        bad_states = {
+            "MERGE_HEAD": "merge in progress",
+            "REVERT_HEAD": "revert in progress",
+            "rebase-merge": "rebase in progress",
+            "rebase-apply": "rebase in progress",
+            "CHERRY_PICK_HEAD": "cherry-pick in progress",
+        }
+        for marker, description in bad_states.items():
+            if (git_dir / marker).exists():
+                return f"Git repo in bad state: {description} ({marker} exists)"
+        return None
+
     def _try_auto_merge(self, task: Task):
-        """Try to merge the agent's branch back to main. Skip on conflict."""
+        """Try to merge the agent's branch back to main. Skip on conflict.
+
+        Uses _git_lock to prevent concurrent merge operations from corrupting
+        the git index when multiple agents complete simultaneously.
+        """
         branch = task.branch
+        if not self._git_lock.acquire(timeout=30):
+            self._log(f"  ⚠ Could not acquire git lock for merge — skipping")
+            return
+        stashed = False
         try:
+            # Check for bad git state before attempting any mutations
+            git_issue = self._check_git_health()
+            if git_issue:
+                self._log(f"  ⚠ Skipping merge: {git_issue}")
+                return
             # Check if branch exists and has commits ahead of main
             result = subprocess.run(
                 ["git", "rev-parse", "--verify", branch],
@@ -1699,14 +2047,39 @@ class Orchestrator:
                 cwd=self.project_dir, capture_output=True, text=True, timeout=10,
             ).stdout.strip()
 
+            # Detached HEAD returns literal "HEAD" — must checkout main
+            if current == "HEAD":
+                self._log(f"  ⚠ Detached HEAD detected — checking out main first")
+
             # Switch to main first if we're not already there
             if current != "main":
+                # Stash any uncommitted changes before switching branches
+                stashed = False
+                stash_check = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if stash_check.stdout.strip():
+                    stash_result = subprocess.run(
+                        ["git", "stash", "push", "--include-untracked", "-m", f"forge-merge-{task.id}"],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                    )
+                    stashed = stash_result.returncode == 0
+
                 checkout = subprocess.run(
                     ["git", "checkout", "main"],
                     cwd=self.project_dir, capture_output=True, text=True, timeout=10,
                 )
                 if checkout.returncode != 0:
-                    self._log(f"  ⚠ Can't checkout main for merge — skipping")
+                    self._log(f"  ⚠ Can't checkout main for merge — skipping (stderr: {checkout.stderr.strip()[:100]})")
+                    # Restore stash if we stashed
+                    if stashed:
+                        pop = subprocess.run(
+                            ["git", "stash", "pop"],
+                            cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                        )
+                        if pop.returncode != 0:
+                            self._log(f"  ⚠ Stash pop failed — stash preserved in stash list")
                     return
 
             # Attempt merge with --no-edit (no interactive editor)
@@ -1717,15 +2090,85 @@ class Orchestrator:
 
             if merge.returncode == 0:
                 self._log(f"  🔀 Auto-merged {branch} → main")
+                # Clean up the branch now that it's merged
+                subprocess.run(
+                    ["git", "branch", "-d", branch],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                # Post-merge safety: run tests to verify merge didn't break anything
+                post_merge_ok = self._post_merge_test()
+                if not post_merge_ok:
+                    self._log(f"  🔴 Tests FAILED after merge — reverting merge to protect main")
+                    # -m 1 is required for reverting merge commits (--no-ff creates merge commits)
+                    revert = subprocess.run(
+                        ["git", "revert", "--no-edit", "-m", "1", "HEAD"],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=30,
+                    )
+                    if revert.returncode == 0:
+                        self._log(f"  ↩ Reverted merge of {branch}. Branch preserved for manual fix.")
+                    else:
+                        self._log(f"  🔴 REVERT FAILED — resetting to pre-merge state: {revert.stderr.strip()[:200]}")
+                        # Abort the failed revert first (clears .git/REVERT_HEAD)
+                        subprocess.run(
+                            ["git", "revert", "--abort"],
+                            cwd=self.project_dir, capture_output=True, timeout=10,
+                        )
+                        # Fallback: hard reset to pre-merge commit to protect main
+                        subprocess.run(
+                            ["git", "reset", "--hard", "HEAD~1"],
+                            cwd=self.project_dir, capture_output=True, timeout=10,
+                        )
             else:
                 # Conflict — abort and leave branch for manual merge
-                subprocess.run(
+                abort = subprocess.run(
                     ["git", "merge", "--abort"],
-                    cwd=self.project_dir, capture_output=True, timeout=10,
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
                 )
-                self._log(f"  ⚠ Merge conflict on {branch} — left for manual merge")
+                if abort.returncode == 0:
+                    self._log(f"  ⚠ Merge conflict on {branch} — left for manual merge")
+                else:
+                    self._log(f"  ❌ Merge conflict + abort failed — repo may be in conflicted state")
+                    self._log(f"     Run manually: git merge --abort")
         except (subprocess.TimeoutExpired, Exception) as e:
             self._log(f"  ⚠ Auto-merge skipped: {e}")
+        finally:
+            # Restore stashed changes if we stashed them
+            if stashed:
+                pop = subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if pop.returncode != 0:
+                    self._log(f"  ⚠ Stash pop failed after merge — stash preserved in stash list")
+            self._git_lock.release()
+
+    def _post_merge_test(self) -> bool:
+        """Quick test run after merging to verify main isn't broken.
+
+        Returns True if tests pass (or no test runner found). Returns False
+        if tests fail, meaning the merge should be reverted.
+        """
+        runners = [
+            (self.project_dir / "package.json", ["cmd", "/c", "npm", "test"] if sys.platform == "win32" else ["npm", "test"]),
+            (self.project_dir / "pytest.ini", ["pytest", "--tb=short", "-q", "--timeout=60"]),
+            (self.project_dir / "pyproject.toml", ["pytest", "--tb=short", "-q", "--timeout=60"]),
+            (self.project_dir / "setup.py", ["pytest", "--tb=short", "-q", "--timeout=60"]),
+        ]
+        cmd = None
+        for marker, test_cmd in runners:
+            if marker.exists():
+                cmd = test_cmd
+                break
+        if not cmd:
+            return True  # No test runner — assume OK
+
+        try:
+            result = subprocess.run(
+                cmd, cwd=self.project_dir, capture_output=True, text=True, timeout=120,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            return True  # Can't run tests — don't block on infrastructure issues
 
     # ════════════════════════════════════════════════════════════
     # MEMORY (persists across sessions)
@@ -1753,22 +2196,28 @@ class Orchestrator:
             "timestamp": datetime.now().isoformat(),
         })
 
-        memory_file.write_text(json.dumps(history[-200:], indent=2), encoding="utf-8")  # Keep last 200
+        _atomic_write(memory_file, json.dumps(history[-200:], indent=2))  # Keep last 200
 
     def load_memory(self) -> dict:
         """Load memory from previous sessions for smarter routing."""
-        memory = {"task_history": [], "health_history": [], "failed_approaches": []}
+        memory = {"task_history": [], "health_history": [], "failed_approaches": {}}
         for name in ["task_history", "health_history"]:
             f = self.forge_dir / "memory" / f"{name}.json"
             if f.exists():
                 try:
                     memory[name] = json.loads(f.read_text(encoding="utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    pass
+                except (json.JSONDecodeError, ValueError) as e:
+                    self._log(f"  ⚠ Memory file corrupted ({name}.json): {e} — backing up")
+                    try:
+                        f.rename(str(f) + ".backup")
+                    except OSError:
+                        pass
 
         # Extract patterns: which providers fail on which task types
         failures = {}
         for entry in memory["task_history"]:
+            if not isinstance(entry, dict):
+                continue  # Skip corrupted entries (e.g., strings instead of dicts)
             if not entry.get("success"):
                 key = f"{entry.get('type', '')}:{entry.get('provider', '')}"
                 failures[key] = failures.get(key, 0) + 1
@@ -1815,7 +2264,8 @@ class Orchestrator:
             if relevant:
                 memory_hint = "\n## Known Issues from Past Runs\n"
                 for k, count in relevant.items():
-                    provider = k.split(":")[1]
+                    parts = k.split(":")
+                    provider = parts[1] if len(parts) >= 2 else parts[0]
                     memory_hint += f"- {provider} failed {count} times on {task.type} tasks\n"
 
         # ── Diff context for review tasks ──
@@ -2044,6 +2494,8 @@ class Orchestrator:
         """Suggest which files the agent should focus on based on task description."""
         # Look for file paths mentioned in the description
         mentioned = re.findall(r'[\w/]+\.(?:py|js|ts|jsx|tsx|json|yaml|md)', task.description)
+        # Filter out path traversal attempts
+        mentioned = [f for f in mentioned if '..' not in f and not f.startswith('/')]
         if mentioned:
             return "\n## Relevant Files\n" + "\n".join(f"- {f}" for f in mentioned[:10])
 
@@ -2076,8 +2528,7 @@ class Orchestrator:
 
     def _save_task(self, task: Task):
         f = self.forge_dir / "tasks" / f"{task.id}.json"
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps({
+        _atomic_write(f, json.dumps({
             "id": task.id, "type": task.type, "title": task.title,
             "description": task.description, "status": task.status.value,
             "depends_on": task.depends_on, "assigned_provider": task.assigned_provider,
@@ -2085,7 +2536,7 @@ class Orchestrator:
             "estimated_minutes": task.estimated_minutes,
             "actual_cost_usd": task.actual_cost_usd,
             "retries": task.retries, "source": task.source,
-        }, indent=2), encoding="utf-8")
+        }, indent=2))
 
     def _parse_cost_from_log(self, task: Task) -> float:
         """Parse tokens from log, record in ledger, calculate cost."""
@@ -2215,7 +2666,7 @@ class Orchestrator:
                 "timestamp": datetime.now().isoformat(),
             })
 
-            ledger_file.write_text(json.dumps(ledger[-500:], indent=2), encoding="utf-8")
+            _atomic_write(ledger_file, json.dumps(ledger[-500:], indent=2))
         finally:
             lock.unlink(missing_ok=True)
 
@@ -2256,17 +2707,20 @@ class Orchestrator:
         done_tasks = [t for t in self.tasks if t.status == TaskStatus.DONE]
         failed_tasks = [t for t in self.tasks if t.status == TaskStatus.FAILED]
 
-        budget_file.write_text(json.dumps({
-            "budget_total": self.config.budget,
-            "total_spent": round(total_cost, 4),
-            "total_input_tokens": total_input,
-            "total_output_tokens": total_output,
-            "total_tokens": total_all,
-            "tasks_done": len(done_tasks),
-            "tasks_failed": len(failed_tasks),
-            "tasks_active": len(self._active_processes),
-            "by_provider": by_provider,
-        }, indent=2), encoding="utf-8")
+        try:
+            _atomic_write(budget_file, json.dumps({
+                "budget_total": self.config.budget,
+                "total_spent": round(total_cost, 4),
+                "total_input_tokens": total_input,
+                "total_output_tokens": total_output,
+                "total_tokens": total_all,
+                "tasks_done": len(done_tasks),
+                "tasks_failed": len(failed_tasks),
+                "tasks_active": len(self._active_processes),
+                "by_provider": by_provider,
+            }, indent=2))
+        except PermissionError:
+            self._log("  ⚠ Could not write spending.json (file locked) — will retry next cycle")
 
         # Keep orchestrator in sync
         self.budget_spent = round(total_cost, 4)
@@ -2276,12 +2730,15 @@ class Orchestrator:
         line = f"[{ts}] {msg}"
         print(line)
         self.run_log.append(line)
+        # Prevent unbounded memory growth in continuous mode
+        if len(self.run_log) > 5000:
+            self.run_log = self.run_log[-3000:]
 
     # ════════════════════════════════════════════════════════════
     # DAG — DEPENDENCY GRAPH
     # ════════════════════════════════════════════════════════════
 
-    def _rebuild_dag(self):
+    def _rebuild_dag(self, _depth: int = 0):
         """Rebuild the dependency DAG from all current tasks."""
         self._dag = DependencyGraph()
         for task in self.tasks:
@@ -2290,6 +2747,9 @@ class Orchestrator:
             self._dag.validate()
         except CycleError as e:
             self._log(f"  ⚠ Circular dependency detected: {e}")
+            if _depth >= 10:
+                self._log("  ❌ Too many cycle-breaking attempts — giving up")
+                return
             # Break the cycle by removing the last dependency
             cycle = e.cycle
             if len(cycle) >= 2:
@@ -2299,7 +2759,7 @@ class Orchestrator:
                     breaker.depends_on.remove(cycle[-1])
                     self._save_task(breaker)
                     self._log(f"    Broke cycle by removing {breaker_id} → {cycle[-1]} dependency")
-                    self._rebuild_dag()  # Retry
+                    self._rebuild_dag(_depth=_depth + 1)  # Retry with depth guard
 
     # ════════════════════════════════════════════════════════════
     # PARALLEL DISPATCH — CONFLICT-AWARE
@@ -2373,7 +2833,9 @@ class Orchestrator:
         """Background loop that checks for SHARED.md changes every 15s."""
         context_file = self.forge_dir / "context" / "SHARED.md"
         while self._context_watcher_running:
-            time.sleep(15)
+            # Use Event.wait() instead of sleep() so shutdown can interrupt immediately
+            if self._context_watcher_stop.wait(timeout=15):
+                break  # Stop signal received
             if not context_file.exists():
                 continue
             new_hash = self._file_hash(context_file)
@@ -2381,8 +2843,14 @@ class Orchestrator:
                 self._shared_md_hash = new_hash
                 self._log("  📝 SHARED.md changed mid-run — context delta will be injected into next prompts")
                 # Write a broadcast mail so in-flight agents get notified on next prompt
+                # Debounce: skip if a broadcast was written in the last 60 seconds
                 mail_dir = self.forge_dir / "mail" / "broadcast"
                 mail_dir.mkdir(parents=True, exist_ok=True)
+                recent_broadcasts = sorted(mail_dir.glob("*-context-update.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+                if recent_broadcasts:
+                    last_mtime = recent_broadcasts[0].stat().st_mtime
+                    if (datetime.now().timestamp() - last_mtime) < 60:
+                        continue  # Debounce — too soon since last broadcast
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                 (mail_dir / f"{ts}-context-update.md").write_text(
                     f"FROM: system\nTO: broadcast\nRE: SHARED.md updated\n---\n"
@@ -2459,7 +2927,7 @@ class Orchestrator:
         checkpoint_file = self.forge_dir / "state" / "checkpoint.json"
         checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            checkpoint_file.write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+            _atomic_write(checkpoint_file, json.dumps(checkpoint, indent=2))
         except Exception:
             pass
 
@@ -2486,10 +2954,16 @@ class Orchestrator:
             except Exception:
                 pass
 
+        # Show resume info
+        done_count = sum(1 for t in self.tasks if t.status == TaskStatus.DONE)
+        total_count = len(self.tasks)
+        if total_count > 0:
+            self._log(f"  🔄 Resuming from checkpoint: {done_count}/{total_count} tasks complete, ${self.budget_spent:.2f} spent")
+
         # Mark previously active tasks for reset
         active_ids = set(data.get("active_task_ids", []))
         if active_ids:
-            self._log(f"  🔄 Checkpoint found {len(active_ids)} previously active tasks — will reset")
+            self._log(f"  🔄 Resetting {len(active_ids)} previously active tasks to READY")
 
         # Clean up the checkpoint now that we've restored
         try:
@@ -2511,11 +2985,17 @@ class Orchestrator:
             return []
 
         # Build a planning prompt
+        skip_dirs = {".forge", "venv", ".venv", "node_modules", "__pycache__", ".git", "dist", "build"}
         existing_files = []
         for ext in ["*.py", "*.js", "*.ts", "*.jsx", "*.tsx"]:
             for f in self.project_dir.rglob(ext):
-                if ".forge" not in str(f) and "node_modules" not in str(f) and "venv" not in str(f):
-                    existing_files.append(str(f.relative_to(self.project_dir)))
+                if any(part in skip_dirs for part in f.parts):
+                    continue
+                existing_files.append(str(f.relative_to(self.project_dir)))
+                if len(existing_files) >= 30:
+                    break
+            if len(existing_files) >= 30:
+                break
         file_list = "\n".join(f"  - {f}" for f in existing_files[:30])
 
         planning_prompt = f"""You are a software architect planning work for a multi-agent coding team.
@@ -2569,17 +3049,38 @@ Output ONLY valid JSON, no markdown fences, no explanation."""
             # Parse JSON from output (handle stream-json from Claude)
             output = result.stdout.strip()
 
-            # Try to find JSON array in the output
-            json_match = re.search(r'\[[\s\S]*\]', output)
-            if not json_match:
-                return []
+            # Try to parse JSON — first try direct parse, then extract array
+            tasks_data = None
+            # Strip markdown fences if present
+            clean = re.sub(r'```(?:json)?\s*', '', output).strip()
+            try:
+                tasks_data = json.loads(clean)
+            except json.JSONDecodeError:
+                # Find the outermost balanced JSON array using bracket counting
+                start = clean.find('[')
+                if start != -1:
+                    depth = 0
+                    for i in range(start, len(clean)):
+                        if clean[i] == '[':
+                            depth += 1
+                        elif clean[i] == ']':
+                            depth -= 1
+                            if depth == 0:
+                                try:
+                                    tasks_data = json.loads(clean[start:i+1])
+                                except json.JSONDecodeError:
+                                    pass
+                                break
 
-            tasks_data = json.loads(json_match.group())
             if not isinstance(tasks_data, list):
                 return []
 
-            self._log(f"  🧠 LLM planner generated {len(tasks_data)} tasks via {planning_provider.name}")
-            return tasks_data
+            # Validate each task dict has required keys
+            required_keys = {"title", "type", "description"}
+            valid_tasks = [t for t in tasks_data if isinstance(t, dict) and required_keys.issubset(t.keys())]
+
+            self._log(f"  🧠 LLM planner generated {len(valid_tasks)} tasks via {planning_provider.name}")
+            return valid_tasks
 
         except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
             self._log(f"  ⚠ LLM planning failed: {e}")
@@ -2626,17 +3127,17 @@ Output ONLY valid JSON, no markdown fences, no explanation."""
                 print(f"    ❌ {t.title[:50]} ({t.retries} retries)")
 
         # Persist summary
-        (self.forge_dir / "budget" / "run_summary.json").write_text(json.dumps({
+        _atomic_write(self.forge_dir / "budget" / "run_summary.json", json.dumps({
             "completed": len(done), "failed": len(failed), "remaining": len(rest),
             "total_cost": self.budget_spent, "budget": self.config.budget,
             "health_score": health["score"], "health_readiness": health["readiness"],
             "provider_costs": provider_costs,
-        }, indent=2), encoding="utf-8")
+        }, indent=2))
 
         # Persist budget spending
-        (self.forge_dir / "budget" / "spending.json").write_text(json.dumps({
+        _atomic_write(self.forge_dir / "budget" / "spending.json", json.dumps({
             "budget_total": self.config.budget,
             "budget_spent": self.budget_spent,
             "transactions": [{"task": t.id, "provider": t.assigned_provider, "cost": t.actual_cost_usd}
                              for t in done],
-        }, indent=2), encoding="utf-8")
+        }, indent=2))

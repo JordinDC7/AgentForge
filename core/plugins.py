@@ -132,11 +132,13 @@ class PluginLoader:
 
     def create_provider(self, name: str, config_override: Optional[dict] = None) -> Optional[BaseProvider]:
         """Instantiate a provider from a loaded plugin."""
+        from copy import deepcopy
         plugin = self._loaded_plugins.get(name)
         if not plugin:
             return None
 
         config, cls = plugin
+        config = deepcopy(config)  # Don't mutate the stored default (capabilities list is mutable)
         if config_override:
             for key, val in config_override.items():
                 if hasattr(config, key):

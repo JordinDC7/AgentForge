@@ -1,6 +1,7 @@
 """Provider implementations for all major AI coding agents."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -219,7 +220,7 @@ class GeminiProvider(BaseProvider):
     """Google Gemini CLI — FREE tier, 1K requests/day, 1M token context."""
 
     def is_available(self) -> bool:
-        return shutil.which("gemini") is not None or shutil.which("npx") is not None
+        return shutil.which("gemini") is not None
 
     def get_version(self) -> Optional[str]:
         try:
@@ -260,7 +261,11 @@ class CodexProvider(BaseProvider):
     """OpenAI Codex CLI — open source, fast, included in ChatGPT Plus."""
 
     def is_available(self) -> bool:
-        return shutil.which("codex") is not None
+        if not shutil.which("codex"):
+            return False
+        if self.config.api_key_env and not os.environ.get(self.config.api_key_env):
+            return False
+        return True
 
     def get_version(self) -> Optional[str]:
         try:
@@ -270,7 +275,7 @@ class CodexProvider(BaseProvider):
             return None
 
     def build_command(self, prompt: str, workdir: Path, role_instructions: str = "", allowed_tools=None, max_budget_usd=None, effort=None) -> list[str]:
-        cmd = ["codex", "--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check"]
+        cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         full_prompt = f"{role_instructions}\n\n{prompt}" if role_instructions else prompt
@@ -286,7 +291,7 @@ class CodexProvider(BaseProvider):
         # Parse Codex token usage: "tokens used\n7,978"
         token_matches = re.findall(r'tokens\s+used\s*\n\s*([\d,]+)', stdout)
         if token_matches:
-            result.total_tokens = int(token_matches[-1].replace(",", ""))
+            result.total_tokens = min(int(token_matches[-1].replace(",", "")), 10_000_000)
             result.input_tokens = int(result.total_tokens * 0.75)
             result.output_tokens = result.total_tokens - result.input_tokens
         # Parse files from Codex output
@@ -300,7 +305,11 @@ class ClaudeProvider(BaseProvider):
     """Anthropic Claude Code — highest accuracy, agent teams."""
 
     def is_available(self) -> bool:
-        return shutil.which("claude") is not None
+        if not shutil.which("claude"):
+            return False
+        if self.config.api_key_env and not os.environ.get(self.config.api_key_env):
+            return False
+        return True
 
     def get_version(self) -> Optional[str]:
         try:
@@ -362,7 +371,11 @@ class AiderProvider(BaseProvider):
     """Aider — git-native, model-agnostic pair programmer."""
 
     def is_available(self) -> bool:
-        return shutil.which("aider") is not None
+        if not shutil.which("aider"):
+            return False
+        if self.config.api_key_env and not os.environ.get(self.config.api_key_env):
+            return False
+        return True
 
     def get_version(self) -> Optional[str]:
         try:
@@ -389,14 +402,18 @@ class AiderProvider(BaseProvider):
         cost_match = re.search(r'Cost:\s*\$([0-9.]+)', stdout)
         if cost_match:
             result.estimated_cost_usd = float(cost_match.group(1))
-        sent_match = re.search(r'([\d.]+)k?\s*sent', stdout)
-        recv_match = re.search(r'([\d.]+)k?\s*received', stdout)
+        sent_match = re.search(r'([\d.]+)(k?)\s*sent', stdout)
+        recv_match = re.search(r'([\d.]+)(k?)\s*received', stdout)
         if sent_match:
             val = float(sent_match.group(1))
-            result.input_tokens = int(val * 1000) if val < 100 else int(val)
+            if sent_match.group(2) == 'k':
+                val *= 1000
+            result.input_tokens = min(int(val), 10_000_000)
         if recv_match:
             val = float(recv_match.group(1))
-            result.output_tokens = int(val * 1000) if val < 100 else int(val)
+            if recv_match.group(2) == 'k':
+                val *= 1000
+            result.output_tokens = min(int(val), 10_000_000)
         result.total_tokens = result.input_tokens + result.output_tokens
         # Parse edited files
         file_matches = re.findall(r'Wrote\s+([^\s]+)', stdout)
@@ -454,7 +471,8 @@ def get_provider(name: str, config_override: Optional[dict] = None) -> BaseProvi
     Checks built-in providers first, then loaded plugins.
     """
     if name in PROVIDER_DEFAULTS:
-        config = PROVIDER_DEFAULTS[name]
+        from copy import deepcopy
+        config = deepcopy(PROVIDER_DEFAULTS[name])
         if config_override:
             for key, val in config_override.items():
                 if hasattr(config, key):

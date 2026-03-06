@@ -81,12 +81,16 @@ class EventBus:
 
     def on(self, event_types: list[EventType] | None, callback: Callable):
         """Register a Python callback for specific event types (None = all)."""
-        self._callbacks.append((event_types, callback))
+        with self._lock:
+            self._callbacks.append((event_types, callback))
 
     def emit(self, event: Event):
         """Dispatch an event to all matching listeners."""
         with self._lock:
             self._event_log.append(event)
+            # Prevent unbounded memory growth in long-running continuous mode
+            if len(self._event_log) > 2000:
+                self._event_log = self._event_log[-1000:]
 
         # Persist to event log file
         self._persist_event(event)
@@ -109,13 +113,24 @@ class EventBus:
                     daemon=True,
                 ).start()
 
-        # Fire Python callbacks
-        for types, cb in self._callbacks:
+        # Fire Python callbacks in background threads (non-blocking)
+        with self._lock:
+            callbacks_snapshot = list(self._callbacks)
+        for types, cb in callbacks_snapshot:
             if types is None or event.type in types:
-                try:
-                    cb(event)
-                except Exception:
-                    pass
+                threading.Thread(
+                    target=self._fire_callback,
+                    args=(cb, event),
+                    daemon=True,
+                ).start()
+
+    def _fire_callback(self, cb: Callable, event: Event):
+        """Run a Python callback safely in a background thread."""
+        try:
+            cb(event)
+        except Exception as e:
+            import sys
+            print(f"[forge] Event callback error ({event.type.value}): {e}", file=sys.stderr)
 
     def _matches(self, event: Event, patterns: list[str]) -> bool:
         if "*" in patterns:
@@ -135,20 +150,36 @@ class EventBus:
             pass  # Webhook failures are non-fatal
 
     def _fire_shell(self, command_template: str, event: Event):
-        """Run a shell command with event data substituted."""
+        """Run a shell command with event data substituted.
+
+        Uses shlex.quote to prevent shell injection from event data.
+        """
+        import shlex
+        import sys as _sys
         try:
+            # Sanitize all values to prevent shell injection
+            # shlex.quote() is POSIX-only; on Windows use subprocess.list2cmdline
+            def _shell_quote(val: str) -> str:
+                if _sys.platform == "win32":
+                    return subprocess.list2cmdline([val])
+                return shlex.quote(val)
+
+            safe_message = _shell_quote(str(event.data.get("message", str(event.data))))
+            safe_task_id = _shell_quote(str(event.data.get("task_id", "")))
+            safe_provider = _shell_quote(str(event.data.get("provider", "")))
+            safe_cost = _shell_quote(str(event.data.get("cost", 0)))
             cmd = command_template.format(
                 event=event.type.value,
-                message=json.dumps(event.data.get("message", str(event.data))),
-                task_id=event.data.get("task_id", ""),
-                provider=event.data.get("provider", ""),
-                cost=event.data.get("cost", 0),
+                message=safe_message,
+                task_id=safe_task_id,
+                provider=safe_provider,
+                cost=safe_cost,
             )
             subprocess.run(
                 cmd, shell=True, timeout=30,
                 capture_output=True, text=True,
             )
-        except (subprocess.TimeoutExpired, Exception):
+        except (subprocess.TimeoutExpired, KeyError, Exception):
             pass
 
     def _persist_event(self, event: Event):

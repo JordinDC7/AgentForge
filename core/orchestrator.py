@@ -121,7 +121,7 @@ class Orchestrator:
         self.budget_spent: float = 0.0
         self.run_log: list[str] = []
         self._active_processes: dict[str, subprocess.Popen] = {}
-        self._active_log_handles: dict[str, object] = {}  # Track log file handles to flush/close
+        self._active_log_handles: dict[str, object] = {}  # Reserved for future use (log handle tracking)
         self._tasks_completed_since_discovery = 0
         self._running = True
         self._style_guide: str = ""  # Cached project style guide
@@ -180,14 +180,12 @@ class Orchestrator:
         self.events.configure(data)
 
     def _handle_shutdown(self, signum, frame):
-        """Graceful shutdown on Ctrl+C — saves checkpoint for resume."""
-        self._log("\n⚠ Shutdown requested. Saving checkpoint...")
+        """Graceful shutdown on Ctrl+C — sets flag, main loop saves checkpoint on exit."""
+        self._log("\n⚠ Shutdown requested. Will save checkpoint and exit after current task...")
         self._running = False
-        self._save_checkpoint()
-        self.events.emit(Event(type=EventType.RUN_COMPLETED, data={
-            "reason": "shutdown", "tasks_done": len([t for t in self.tasks if t.status == TaskStatus.DONE]),
-            "budget_spent": self.budget_spent,
-        }))
+        # Don't save checkpoint here — let the main loop exit cleanly and save.
+        # Calling _save_checkpoint from a signal handler risks corrupting files
+        # if the main loop is mid-write.
 
     # ════════════════════════════════════════════════════════════
     # INIT
@@ -798,7 +796,7 @@ class Orchestrator:
             # Sample a few files for style
             for f in py_files[:5]:
                 try:
-                    content = f.read_text(errors="replace")
+                    content = f.read_text(encoding="utf-8", errors="replace")
                     lines = content.split("\n")
 
                     # Detect indentation
@@ -851,7 +849,7 @@ class Orchestrator:
             patterns.append("Language: JavaScript/TypeScript")
             for f in js_files[:3]:
                 try:
-                    content = f.read_text(errors="replace")
+                    content = f.read_text(encoding="utf-8", errors="replace")
                     if "import React" in content or "from 'react'" in content:
                         patterns.append("Framework: React")
                     if "export default function" in content:
@@ -1326,9 +1324,13 @@ class Orchestrator:
                     if task.retries < task.max_retries:
                         self._log(f"  ⚠ {task_id} passed but failed validation: {validation['reason']}")
                         self._log(f"    Retrying ({task.retries}/{task.max_retries}) with validation feedback...")
-                        # Inject failure context into the task description for the retry
+                        # Replace (not append) previous failure context to prevent description bloat
+                        marker = "\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\n"
+                        if marker in task.description:
+                            task.description = task.description[:task.description.index(marker)]
                         task.description += (
                             f"\n\n## PREVIOUS ATTEMPT FAILED VALIDATION\n"
+                            f"Attempt {task.retries}/{task.max_retries}\n"
                             f"Reason: {validation['reason']}\n"
                             f"{validation.get('details', '')}\n"
                             f"Fix the issues above and try again.\n"
@@ -1393,9 +1395,13 @@ class Orchestrator:
                         "max_retries": task.max_retries, "provider": task.assigned_provider,
                     }))
                     if error_context:
+                        # Replace (not append) to prevent description bloat on repeated retries
+                        marker = "\n\n## PREVIOUS ATTEMPT CRASHED\n"
+                        if marker in task.description:
+                            task.description = task.description[:task.description.index(marker)]
                         task.description += (
                             f"\n\n## PREVIOUS ATTEMPT CRASHED\n"
-                            f"Exit code: {ret}\n"
+                            f"Attempt {task.retries}/{task.max_retries} | Exit code: {ret}\n"
                             f"Error output:\n```\n{error_context}\n```\n"
                             f"Do NOT repeat the same approach. Fix the error.\n"
                         )
@@ -1563,6 +1569,22 @@ class Orchestrator:
         if not cmd:
             return None  # No test runner found — skip
 
+        # Checkout the task's branch so we test the right code
+        prev_branch = None
+        if task.branch:
+            try:
+                prev_branch = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                if prev_branch != task.branch:
+                    subprocess.run(
+                        ["git", "checkout", task.branch],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                    )
+            except Exception:
+                pass
+
         try:
             result = subprocess.run(
                 cmd, cwd=self.project_dir, capture_output=True, text=True, timeout=120,
@@ -1580,6 +1602,16 @@ class Orchestrator:
             return {"passed": False, "reason": "Tests timed out (>2min)", "details": "Tests are hanging. Check for infinite loops."}
         except FileNotFoundError:
             return None  # Test runner not installed — skip
+        finally:
+            # Restore previous branch
+            if prev_branch and prev_branch != task.branch:
+                try:
+                    subprocess.run(
+                        ["git", "checkout", prev_branch],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                    )
+                except Exception:
+                    pass
 
         return {"passed": True}
 
@@ -1590,7 +1622,7 @@ class Orchestrator:
         if not log_files:
             return ""
         try:
-            content = log_files[0].read_text(errors="replace")
+            content = log_files[0].read_text(encoding="utf-8", errors="replace")
             lines = content.strip().split("\n")
             return "\n".join(lines[-20:])
         except Exception:
@@ -1661,11 +1693,21 @@ class Orchestrator:
             if result.returncode != 0:
                 return  # Branch doesn't exist (agent may not have created it)
 
-            # Get current branch to restore later
+            # Always merge into main — not whatever branch HEAD is on
             current = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 cwd=self.project_dir, capture_output=True, text=True, timeout=10,
             ).stdout.strip()
+
+            # Switch to main first if we're not already there
+            if current != "main":
+                checkout = subprocess.run(
+                    ["git", "checkout", "main"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+                if checkout.returncode != 0:
+                    self._log(f"  ⚠ Can't checkout main for merge — skipping")
+                    return
 
             # Attempt merge with --no-edit (no interactive editor)
             merge = subprocess.run(
@@ -1674,7 +1716,7 @@ class Orchestrator:
             )
 
             if merge.returncode == 0:
-                self._log(f"  🔀 Auto-merged {branch} → {current}")
+                self._log(f"  🔀 Auto-merged {branch} → main")
             else:
                 # Conflict — abort and leave branch for manual merge
                 subprocess.run(
@@ -2053,7 +2095,7 @@ class Orchestrator:
             return 0.0
 
         try:
-            content = log_files[0].read_text(errors="replace")
+            content = log_files[0].read_text(encoding="utf-8", errors="replace")
         except Exception:
             return 0.0
 

@@ -67,9 +67,11 @@ class DiscoveryEngine:
         work.extend(self._scan_missing_docs())
         work.extend(self._scan_security_issues())
 
-        # Deduplicate against already-known tasks
+        # Deduplicate against already-known tasks (case-insensitive + prefix match)
         known_ids = self._load_known_task_titles()
-        work = [w for w in work if w.title not in known_ids]
+        work = [w for w in work
+                if w.title.strip().lower() not in known_ids
+                and w.title.strip().lower()[:60] not in known_ids]
 
         # Sort by priority
         work.sort(key=lambda w: w.priority, reverse=True)
@@ -513,14 +515,20 @@ class DiscoveryEngine:
         return items[:5]
 
     def _load_known_task_titles(self) -> set:
-        """Load titles of tasks already on the board to avoid duplicates."""
+        """Load titles of tasks already on the board to avoid duplicates.
+
+        Uses case-insensitive matching AND prefix matching (first 60 chars)
+        to catch near-duplicates from slightly different discovery runs.
+        """
         titles = set()
         tasks_dir = self.forge_dir / "tasks"
         if tasks_dir.exists():
             for f in tasks_dir.glob("*.json"):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
-                    titles.add(data.get("title", ""))
+                    title = data.get("title", "").strip().lower()
+                    titles.add(title)
+                    titles.add(title[:60])  # Prefix match catches truncation diffs
                 except (json.JSONDecodeError, KeyError):
                     pass
         return titles

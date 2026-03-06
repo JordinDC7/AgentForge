@@ -466,7 +466,16 @@ class Orchestrator:
         discovered = self.discovery.discover_all(self.config.goal)
         new_count = 0
 
+        # Build set of existing task titles for deduplication
+        existing_titles = {t.title.strip().lower() for t in self.tasks}
+        # Also deduplicate by first 60 chars (catches minor rewording)
+        existing_prefixes = {t.title.strip().lower()[:60] for t in self.tasks}
+
         for work in discovered[:10]:  # Cap per cycle
+            title_lower = work.title.strip().lower()
+            # Skip if we already have a task with this title (or very similar)
+            if title_lower in existing_titles or title_lower[:60] in existing_prefixes:
+                continue
             task_id = f"disc-{int(time.time())}-{new_count}"
             task = Task(
                 id=task_id,
@@ -478,6 +487,8 @@ class Orchestrator:
             )
             self.tasks.append(task)
             self._save_task(task)
+            existing_titles.add(title_lower)
+            existing_prefixes.add(title_lower[:60])
             new_count += 1
 
         # LLM-assisted planning for the goal (only on first discovery with a goal)

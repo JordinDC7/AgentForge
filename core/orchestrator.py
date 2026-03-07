@@ -320,9 +320,10 @@ class Orchestrator:
             self._log(f"\n📡 {reason}. Running discovery...")
             self._run_discovery_cycle()
 
-        # Clean up stale locks and stuck tasks from previous runs
+        # Clean up stale locks, stuck tasks, and merged branches from previous runs
         self._cleanup_stale_locks()
         self._reset_stuck_tasks()
+        self._cleanup_merged_branches()
 
         # Extract project coding style once at startup (cached for all agents)
         self._style_guide = self._extract_style_guide()
@@ -416,6 +417,8 @@ class Orchestrator:
             if discovery_due_by_count or discovery_due_by_time:
                 if discovery_due_by_time:
                     self._log(f"  📡 Periodic re-discovery ({int(time_since_discovery)}s since last scan)")
+                self._archive_done_tasks()
+                self._cleanup_merged_branches()
                 self._run_discovery_cycle()
                 self._tasks_completed_since_discovery = 0
                 self._last_discovery_time = time.time()
@@ -807,10 +810,10 @@ class Orchestrator:
         self._log(f"  🏗️ Created architecture assessment task → routes to Claude Sonnet")
 
     def _inject_review_tasks(self):
-        """Create review tasks for implementation work in the queue."""
+        """Create review tasks for completed implementation work that wasn't reviewed yet."""
         impl_tasks = [t for t in self.tasks
                       if t.type in ("backend", "frontend")
-                      and t.status in (TaskStatus.READY, TaskStatus.BACKLOG)]
+                      and t.status == TaskStatus.DONE]
         existing_reviews = {t.title for t in self.tasks if t.type == "review"}
 
         for impl_task in impl_tasks[:3]:  # Cap at 3 reviews per cycle
@@ -1126,10 +1129,99 @@ class Orchestrator:
                     except PermissionError:
                         self._log(f"  ⚠ Cannot remove lock for {task.id} (file in use) — skipping reset")
                         continue
+                    # Check if the branch has any work — if not, clear it
+                    if task.branch:
+                        try:
+                            branch_check = subprocess.run(
+                                ["git", "rev-parse", "--verify", task.branch],
+                                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                            )
+                            if branch_check.returncode != 0:
+                                task.branch = ""  # Branch doesn't exist
+                            else:
+                                # Check if branch has commits ahead of main
+                                ahead = subprocess.run(
+                                    ["git", "rev-list", "--count", f"main..{task.branch}"],
+                                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                                )
+                                if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+                                    task.branch = ""  # Branch exists but has no commits
+                        except Exception:
+                            task.branch = ""
+                    task.retries = min(task.retries + 1, task.max_retries)
                     self._set_status(task, TaskStatus.READY)
+                    self._save_task(task)
                     reset_count += 1
         if reset_count:
             self._log(f"  🔄 Reset {reset_count} stuck task(s) from previous run back to READY")
+
+    def _archive_done_tasks(self):
+        """Move completed task files to .forge/tasks/archive/ to keep the active queue clean.
+
+        Only archives tasks that are DONE and whose review (if any) is also done.
+        """
+        archive_dir = self.forge_dir / "tasks" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = 0
+
+        # Find tasks eligible for archival
+        done_ids = {t.id for t in self.tasks if t.status == TaskStatus.DONE}
+        review_pending = {t.id.replace("review-", "")
+                          for t in self.tasks
+                          if t.type == "review" and t.status not in (TaskStatus.DONE, TaskStatus.FAILED)}
+
+        for task in list(self.tasks):
+            if task.status not in (TaskStatus.DONE, TaskStatus.FAILED):
+                continue
+            # Don't archive if there's a pending review for this task
+            if task.id in review_pending:
+                continue
+            # Don't archive review tasks whose fix tasks are still pending
+            if task.type == "review":
+                fix_id = f"fix-{task.id}"
+                if any(t.id == fix_id and t.status not in (TaskStatus.DONE, TaskStatus.FAILED)
+                       for t in self.tasks):
+                    continue
+
+            # Move the task file to archive
+            src = self.forge_dir / "tasks" / f"{task.id}.json"
+            dst = archive_dir / f"{task.id}.json"
+            if src.exists():
+                try:
+                    import shutil
+                    shutil.move(str(src), str(dst))
+                    archived += 1
+                except OSError:
+                    continue
+
+            # Remove from in-memory task list
+            self.tasks.remove(task)
+
+        if archived:
+            self._log(f"  📦 Archived {archived} completed task(s)")
+
+    def _cleanup_merged_branches(self):
+        """Delete forge/* branches that have been merged to main."""
+        try:
+            result = subprocess.run(
+                ["git", "branch", "--merged", "main"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return
+            cleaned = 0
+            for line in result.stdout.strip().split("\n"):
+                branch = line.strip().lstrip("* ")
+                if branch.startswith("forge/"):
+                    subprocess.run(
+                        ["git", "branch", "-d", branch],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                    )
+                    cleaned += 1
+            if cleaned:
+                self._log(f"  🧹 Cleaned {cleaned} merged forge branch(es)")
+        except Exception:
+            pass
 
     def _print_heartbeat(self):
         """Print a one-line status so the user knows the orchestrator is alive."""
@@ -1391,8 +1483,19 @@ class Orchestrator:
 
         task.branch = branch
 
-        # Pre-create the branch so agents don't accidentally commit to main
+        # Pre-create the branch from latest main so agents start from clean state
         try:
+            # Ensure we're on main first
+            current_head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if current_head != "main":
+                subprocess.run(
+                    ["git", "checkout", "main"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                )
+            # Create branch from main HEAD (ensures latest commits)
             subprocess.run(
                 ["git", "branch", branch],
                 cwd=self.project_dir, capture_output=True, text=True, timeout=10,
@@ -1600,6 +1703,8 @@ class Orchestrator:
                     self._consecutive_failures = 0  # Reset failure streak on success
                     self._failure_warned = False
                     self._save_to_memory(task, success=True)
+                    if task.source in ("vision", "vision_future"):
+                        self._mark_vision_complete(task)
                     self._write_completion_handoff(task, duration)
                     self.events.emit(Event(type=EventType.TASK_COMPLETED, data={
                         "task_id": task.id, "title": task.title, "type": task.type,
@@ -2132,6 +2237,19 @@ class Orchestrator:
         except (subprocess.TimeoutExpired, Exception) as e:
             self._log(f"  ⚠ Auto-merge skipped: {e}")
         finally:
+            # Ensure we're back on main after any merge attempt
+            try:
+                post_head = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                if post_head != "main":
+                    subprocess.run(
+                        ["git", "checkout", "main"],
+                        cwd=self.project_dir, capture_output=True, text=True, timeout=10,
+                    )
+            except Exception:
+                pass
             # Restore stashed changes if we stashed them
             if stashed:
                 pop = subprocess.run(
@@ -2307,15 +2425,19 @@ class Orchestrator:
 - No lint errors introduced
 - Exit 0 when done, exit 1 if stuck
 
+## Git Workflow (IMPORTANT)
+1. FIRST: Run `git checkout {task.branch}` — your branch is pre-created from main
+2. Make your changes and commit to this branch
+3. Run tests before committing. Fix failures.
+4. Do NOT commit to main directly
+
 ## Communication Rules
-1. Work on branch: {task.branch}
-2. Run tests before committing. Fix failures.
-3. **Sending mail to other agents:**
+1. **Sending mail to other agents:**
    - To a specific agent type: write to `.forge/mail/<type>/<timestamp>.md`
      Types: architecture, backend, frontend, testing, review
    - To ALL agents: write to `.forge/mail/broadcast/<timestamp>.md`
    - Use timestamp format: `YYYYMMDD-HHMMSS`
-4. **Mail format** (so other agents can parse it):
+2. **Mail format** (so other agents can parse it):
    ```
    FROM: {task.type}
    TO: <target-type or broadcast>
@@ -2323,13 +2445,90 @@ class Orchestrator:
    ---
    <your message>
    ```
-5. **When to send mail:**
+3. **When to send mail:**
    - When you complete your task (notify the next agent in the pipeline)
    - When you discover something that affects another agent's work
    - When you're blocked and need input from another agent type
-6. Update .forge/context/SHARED.md with architectural decisions or API changes.
-7. Exit 0 when done. Exit 1 if stuck.
+4. Update .forge/context/SHARED.md with architectural decisions or API changes.
+5. Exit 0 when done. Exit 1 if stuck.
 """
+
+    def _mark_vision_complete(self, task: Task):
+        """Mark the corresponding VISION.md item as done so discovery doesn't recreate it.
+
+        For checklist items: - [ ] item → - [x] item
+        For feature sections: ### N. Feature → ### N. Feature ✅
+        """
+        vision_file = self.project_dir / "VISION.md"
+        if not vision_file.exists():
+            return
+
+        try:
+            content = vision_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+
+        original = content
+
+        # Extract the item text from the task title
+        # Titles look like "Build: item text", "Implement: Feature Name", "Future: item text"
+        item_text = task.title
+        for prefix in ("Build: ", "Implement: ", "Design: ", "Future: "):
+            if item_text.startswith(prefix):
+                item_text = item_text[len(prefix):]
+                break
+
+        if not item_text or len(item_text) < 5:
+            return
+
+        updated = False
+
+        # --- Check off checklist items: - [ ] item → - [x] item ---
+        # Match flexibly (item may have been truncated at 80 chars in the title)
+        for line in content.split("\n"):
+            checkbox_match = re.match(r'(-\s*\[)\s*\](\s*.+)', line)
+            if checkbox_match:
+                line_text = checkbox_match.group(2).strip()
+                # Match if the vision line starts with our item text or vice versa
+                if (line_text.lower().startswith(item_text[:40].lower()) or
+                        item_text.lower().startswith(line_text[:40].lower())):
+                    checked = f"{checkbox_match.group(1)}x]{checkbox_match.group(2)}"
+                    content = content.replace(line, checked, 1)
+                    updated = True
+                    break
+
+        # --- Mark feature sections: ### N. Feature → ### N. Feature ✅ ---
+        if not updated:
+            for line in content.split("\n"):
+                heading_match = re.match(r'(###\s*\d+\.\s*)(.+)', line)
+                if heading_match and "✅" not in line:
+                    heading_text = heading_match.group(2).strip()
+                    if (heading_text.lower().startswith(item_text[:40].lower()) or
+                            item_text.lower().startswith(heading_text[:40].lower())):
+                        marked = f"{line} ✅"
+                        content = content.replace(line, marked, 1)
+                        updated = True
+                        break
+
+        # --- Mark plain bullet items (Future Features): - item → - ✅ item ---
+        if not updated:
+            for line in content.split("\n"):
+                bullet_match = re.match(r'(-\s+)(.+)', line)
+                if bullet_match and "✅" not in line and "[" not in line:
+                    bullet_text = bullet_match.group(2).strip()
+                    if (bullet_text.lower().startswith(item_text[:40].lower()) or
+                            item_text.lower().startswith(bullet_text[:40].lower())):
+                        marked = f"{bullet_match.group(1)}✅ {bullet_match.group(2)}"
+                        content = content.replace(line, marked, 1)
+                        updated = True
+                        break
+
+        if updated and content != original:
+            try:
+                _atomic_write(vision_file, content)
+                self._log(f"  📋 Checked off in VISION.md: {item_text[:60]}")
+            except Exception as e:
+                self._log(f"  ⚠ Could not update VISION.md: {e}")
 
     def _write_completion_handoff(self, task: Task, duration: float):
         """Write a handoff mail when a task completes so downstream agents know what was done."""

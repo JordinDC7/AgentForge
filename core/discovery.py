@@ -176,6 +176,10 @@ class DiscoveryEngine:
             feature_name = feature_name.strip()
             feature_body = feature_body.strip()
 
+            # Skip features already marked complete (✅ in heading)
+            if "✅" in feature_name:
+                continue
+
             # Look for keywords from the feature in the codebase
             keywords = self._extract_keywords(feature_name, feature_body)
             if not self._keywords_in_codebase(keywords):
@@ -228,6 +232,9 @@ class DiscoveryEngine:
             future_items = re.findall(r'-\s+(.+)', future_match.group(1))
             for item in future_items[:5]:  # Cap at 5 future features
                 item = item.strip()
+                # Skip items already marked complete
+                if item.startswith("✅") or item.startswith("[x]") or item.startswith("[X]"):
+                    continue
                 if not self._evidence_exists(item):
                     items.append(DiscoveredWork(
                         source="vision_future",
@@ -369,6 +376,8 @@ class DiscoveryEngine:
         pattern_regexes = {p: re.compile(rf'\b{p}\b', re.IGNORECASE) for p in patterns}
         skip_dirs = {"node_modules", ".forge", "venv", ".venv", "__pycache__", ".git", "dist", "build"}
         extensions = {".py", ".js", ".ts", ".jsx", ".tsx"}
+        # Agent-created temp scripts in project root — skip to avoid scanner noise
+        _agent_prefixes = ("apply_", "patch_", "fix_", "temp_", "tmp_", "setup_forge", "update_")
 
         try:
             file_count = 0
@@ -376,6 +385,9 @@ class DiscoveryEngine:
                 if f.suffix not in extensions:
                     continue
                 if any(part in skip_dirs for part in f.parts):
+                    continue
+                # Skip agent-generated temp scripts in project root
+                if f.parent == self.project_dir and f.name.startswith(_agent_prefixes):
                     continue
                 file_count += 1
                 if file_count > 200:
@@ -662,6 +674,7 @@ class DiscoveryEngine:
         ]
         skip_dirs = {"node_modules", ".forge", "venv", ".venv", "__pycache__", ".git", "dist", "build"}
         extensions = {".py", ".js", ".ts", ".env"}
+        _agent_prefixes = ("apply_", "patch_", "fix_", "temp_", "tmp_", "setup_forge", "update_")
 
         try:
             file_count = 0
@@ -669,6 +682,8 @@ class DiscoveryEngine:
                 if f.suffix not in extensions:
                     continue
                 if any(part in skip_dirs for part in f.parts):
+                    continue
+                if f.parent == self.project_dir and f.name.startswith(_agent_prefixes):
                     continue
                 if ".env.example" in f.name or ".env.sample" in f.name:
                     continue
@@ -713,8 +728,15 @@ class DiscoveryEngine:
         prefixes = set()
         failed = set()
         tasks_dir = self.forge_dir / "tasks"
-        if tasks_dir.exists():
-            for f in tasks_dir.glob("*.json"):
+        # Scan both active tasks and archived tasks to prevent re-creating completed work
+        scan_dirs = [tasks_dir]
+        archive_dir = tasks_dir / "archive"
+        if archive_dir.exists():
+            scan_dirs.append(archive_dir)
+        for d in scan_dirs:
+            if not d.exists():
+                continue
+            for f in d.glob("*.json"):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
                     title = data.get("title", "").strip().lower()
